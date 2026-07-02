@@ -452,7 +452,7 @@ try:
                 st.markdown("#####  Saúde Geral dos Lotes Macro (%)")
                 dados_saude = obtener_dados_pizza(df_macro, "Classificacao_Saude")
                 cores_saude = {
-                    "VALIDADE OK": "#08D81A",
+                    "VALIDADE OK": "#07E249",
                     "À VENCER": "#E9DA0D",
                     "VENCIDO": "#B71C1C",
                 }
