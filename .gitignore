@@ -1,0 +1,24 @@
+# Ambiente virtual
+venv/
+.env/
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
+
+# Cache Streamlit
+.streamlit/
+
+# Logs
+*.log
+
+~$*.xlsx
+
+# Bloquear planilhas reais e dados
+*.xlsx
+*.xls
+*.csv
