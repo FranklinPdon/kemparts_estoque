@@ -454,7 +454,7 @@ try:
                 cores_saude = {
                     "VALIDADE OK": "#07E249",
                     "À VENCER": "#E9DA0D",
-                    "VENCIDO": "#B71C1C",
+                    "VENCIDO": "#E91010",
                 }
 
                 fig_saude = px.pie(
