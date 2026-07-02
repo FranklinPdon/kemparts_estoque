@@ -429,7 +429,7 @@ try:
                     names="Classificacao_Giro",
                     values="Custo total estoque",
                     hole=0.4,
-                    color_discrete_sequence=["#2E7D32", "#C62828"],
+                    color_discrete_sequence=["#E91010", "#07E249"],
                     custom_data=["Maior_Impacto"],
                 )
                 fig_giro.update_traces(
@@ -452,8 +452,8 @@ try:
                 st.markdown("#####  Saúde Geral dos Lotes Macro (%)")
                 dados_saude = obtener_dados_pizza(df_macro, "Classificacao_Saude")
                 cores_saude = {
-                    "VALIDADE OK": "#1565C0",
-                    "À VENCER": "#EF6C00",
+                    "VALIDADE OK": "#08D81A",
+                    "À VENCER": "#E9DA0D",
                     "VENCIDO": "#B71C1C",
                 }
 
