@@ -170,6 +170,28 @@ def preparar_dados_transito(df_ped_compra):
         columns={df_transito.columns[pos]: nome for nome, pos in posicoes.items()}
     )
 
+    # Tenta localizar automaticamente uma coluna de container/processo na aba PED. COMPRA.
+    # Se a planilha ainda não tiver essa informação, o painel cria uma referência executiva
+    # agrupando fornecedor + filial + data de entrega.
+    coluna_ref_container = None
+    palavras_chave_container = [
+        "container",
+        "cntr",
+        "processo",
+        "embarque",
+        "invoice",
+        "pedido",
+        "bl",
+        "referencia",
+        "referência",
+    ]
+
+    for coluna in df_transito.columns:
+        nome_coluna = str(coluna).strip().lower()
+        if any(palavra in nome_coluna for palavra in palavras_chave_container):
+            coluna_ref_container = coluna
+            break
+
     colunas_base = [
         "Filial",
         "Produto",
@@ -177,6 +199,14 @@ def preparar_dados_transito(df_ped_compra):
         "Fornecedor",
         "Data_Entrega_Armazem",
     ]
+
+    if coluna_ref_container is not None:
+        df_transito["Container_Ref"] = df_transito[coluna_ref_container].astype(str)
+        colunas_base.append("Container_Ref")
+    else:
+        df_transito["Container_Ref"] = ""
+        colunas_base.append("Container_Ref")
+
     df_transito = df_transito[colunas_base].copy()
 
     df_transito["Data_Entrega_Armazem"] = pd.to_datetime(
@@ -202,6 +232,37 @@ def preparar_dados_transito(df_ped_compra):
     df_transito["Dias_Para_Entrega"] = (
         df_transito["Data_Entrega_Armazem"] - DATA_HOJE
     ).dt.days
+
+    # Caso não exista uma coluna real de container/processo, cria uma referência consolidada
+    # para permitir uma visão gerencial por "embarque previsto".
+    sem_ref = (
+        df_transito["Container_Ref"].isna()
+        | (df_transito["Container_Ref"].astype(str).str.strip() == "")
+        | (df_transito["Container_Ref"].astype(str).str.lower().isin(["nan", "none"]))
+    )
+
+    df_transito.loc[sem_ref, "Container_Ref"] = (
+        "EMB-"
+        + df_transito.loc[sem_ref, "Fornecedor"].astype(str).str[:12].str.upper()
+        + "-"
+        + df_transito.loc[sem_ref, "Filial"].astype(str).str[:6].str.upper()
+        + "-"
+        + df_transito.loc[sem_ref, "Data_Entrega_Armazem"].dt.strftime("%Y%m%d")
+    )
+
+    def classificar_status_container(dias):
+        if dias < 0:
+            return "🔴 Atrasado"
+        elif dias <= 15:
+            return "🟢 Chega em até 15 dias"
+        elif dias <= 45:
+            return "🟡 Chega em 16 a 45 dias"
+        else:
+            return "🔵 Futuro"
+
+    df_transito["Status_Entrega"] = df_transito["Dias_Para_Entrega"].apply(
+        classificar_status_container
+    )
 
     return df_transito
 
@@ -414,13 +475,16 @@ try:
     # ======================================================
     # TABS DE NAVEGAÇÃO PRINCIPAL
     # ======================================================
-    tab_visao_geral, tab_detalhes_lote, tab_graficos, tab_transito = st.tabs(
-        [
-            " VISÃO GERAL DO PRODUTO",
-            " TODOS OS LOTES DESTE PRODUTO",
-            " ANÁLISE GRÁFICA MACRO",
-            " ESTOQUE EM TRÂNSITO",
-        ]
+    tab_visao_geral, tab_detalhes_lote, tab_graficos, tab_transito, tab_containers = (
+        st.tabs(
+            [
+                " VISÃO GERAL DO PRODUTO",
+                " TODOS OS LOTES DESTE PRODUTO",
+                " ANÁLISE GRÁFICA MACRO",
+                " ESTOQUE EM TRÂNSITO",
+                " 🚢 CONTAINERS",
+            ]
+        )
     )
 
     # --------------------------------------------------
@@ -1013,6 +1077,377 @@ try:
                 ]
 
                 st.dataframe(tabela_transito, use_container_width=True, hide_index=True)
+
+    # --------------------------------------------------
+    # TAB 5: CONTAINERS / EMBARQUES
+    # --------------------------------------------------
+    with tab_containers:
+        st.markdown("###  Torre de Controle de Containers")
+        st.caption(
+            "Visão executiva dos containers/embarques vinculados aos pedidos de compra em andamento. "
+            "Quando não houver número de container na planilha, o painel consolida uma referência por fornecedor, filial e data prevista."
+        )
+
+        if df_transito.empty:
+            st.warning(
+                "Não foram encontrados dados válidos na aba PED. COMPRA para montar a visão de containers."
+            )
+        else:
+            col_cf1, col_cf2, col_cf3 = st.columns([1, 1, 1])
+
+            opcoes_status_container = ["TODOS"] + sorted(
+                df_transito["Status_Entrega"].dropna().astype(str).unique()
+            )
+            opcoes_fornecedor_container = ["TODOS"] + sorted(
+                df_transito["Fornecedor"].dropna().astype(str).unique()
+            )
+            opcoes_filial_container = ["TODAS"] + sorted(
+                df_transito["Filial"].dropna().astype(str).unique()
+            )
+
+            with col_cf1:
+                status_container = st.multiselect(
+                    "Filtrar status:",
+                    options=opcoes_status_container,
+                    default=["TODOS"],
+                    key="status_container",
+                )
+            with col_cf2:
+                fornecedor_container = st.multiselect(
+                    "Filtrar fornecedor:",
+                    options=opcoes_fornecedor_container,
+                    default=["TODOS"],
+                    key="fornecedor_container",
+                )
+            with col_cf3:
+                filial_container = st.multiselect(
+                    "Filtrar filial/matriz:",
+                    options=opcoes_filial_container,
+                    default=["TODAS"],
+                    key="filial_container",
+                )
+
+            df_container_base = df_transito.copy()
+
+            if not ("TODOS" in status_container or not status_container):
+                df_container_base = df_container_base[
+                    df_container_base["Status_Entrega"]
+                    .astype(str)
+                    .isin(status_container)
+                ]
+
+            if not ("TODOS" in fornecedor_container or not fornecedor_container):
+                df_container_base = df_container_base[
+                    df_container_base["Fornecedor"]
+                    .astype(str)
+                    .isin(fornecedor_container)
+                ]
+
+            if not ("TODAS" in filial_container or not filial_container):
+                df_container_base = df_container_base[
+                    df_container_base["Filial"].astype(str).isin(filial_container)
+                ]
+
+            if df_container_base.empty:
+                st.info("Sem containers/embarques para os filtros selecionados.")
+            else:
+                df_containers = (
+                    df_container_base.groupby("Container_Ref", dropna=False)
+                    .agg(
+                        Fornecedor=(
+                            "Fornecedor",
+                            lambda x: ", ".join(sorted(set(x.astype(str)))[:3]),
+                        ),
+                        Filial=(
+                            "Filial",
+                            lambda x: ", ".join(sorted(set(x.astype(str)))[:3]),
+                        ),
+                        Data_Entrega_Armazem=("Data_Entrega_Armazem", "min"),
+                        Quantidade_kg=("Quantidade_kg", "sum"),
+                        Produtos=("Produto", "nunique"),
+                        Status_Entrega=("Status_Entrega", lambda x: x.iloc[0]),
+                    )
+                    .reset_index()
+                )
+
+                df_containers["Dias_Para_Entrega"] = (
+                    df_containers["Data_Entrega_Armazem"] - DATA_HOJE
+                ).dt.days
+                df_containers["Mes_Entrega"] = (
+                    df_containers["Data_Entrega_Armazem"]
+                    .dt.to_period("M")
+                    .dt.to_timestamp()
+                )
+
+                total_containers = df_containers["Container_Ref"].nunique()
+                volume_total_containers = df_containers["Quantidade_kg"].sum()
+                containers_atrasados = df_containers[
+                    df_containers["Dias_Para_Entrega"] < 0
+                ]["Container_Ref"].nunique()
+                proxima_chegada_container = df_containers["Data_Entrega_Armazem"].min()
+
+                cc1, cc2, cc3, cc4 = st.columns(4)
+                with cc1:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-title">Containers / Embarques</div><div class="metric-value">{total_containers}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cc2:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-title">Volume Consolidado</div><div class="metric-value">{formatar_kg(volume_total_containers)}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cc3:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-title">Atrasados</div><div class="metric-value">{containers_atrasados}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cc4:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-title">Próxima Chegada</div><div class="metric-value">{proxima_chegada_container.strftime("%d/%m/%Y")}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Insight executivo de containers
+                volume_por_mes_container = (
+                    df_containers.groupby("Mes_Entrega", as_index=False)[
+                        "Quantidade_kg"
+                    ]
+                    .sum()
+                    .sort_values("Mes_Entrega")
+                )
+                mes_pico_container = volume_por_mes_container.loc[
+                    volume_por_mes_container["Quantidade_kg"].idxmax()
+                ]
+
+                top_container_fornecedor = (
+                    df_containers.groupby("Fornecedor", dropna=False)["Quantidade_kg"]
+                    .sum()
+                    .sort_values(ascending=False)
+                )
+                fornecedor_pico_container = str(top_container_fornecedor.index[0])
+                perc_fornecedor_pico_container = (
+                    top_container_fornecedor.iloc[0] / volume_total_containers * 100
+                    if volume_total_containers > 0
+                    else 0
+                )
+
+                st.markdown(
+                    f"""
+                    <div class="alert-box" style="border-left-color: #FFB800 !important;">
+                        <span class="alert-title"> Resumo Executivo de Containers</span>
+                        <span class="alert-text">
+                            Existem <strong>{total_containers}</strong> containers/embarques monitorados, totalizando <strong>{formatar_kg(volume_total_containers)}</strong>.<br>
+                            O maior volume está concentrado em <strong>{mes_pico_container["Mes_Entrega"].strftime("%m/%Y")}</strong>, com <strong>{formatar_kg(mes_pico_container["Quantidade_kg"])}</strong> previstos.<br>
+                            O principal fornecedor no pipeline é <strong>{fornecedor_pico_container}</strong>, representando <strong>{perc_fornecedor_pico_container:.1f}%</strong> do volume consolidado.<br>
+                            Há <strong>{containers_atrasados}</strong> containers/embarques com entrega vencida em relação à data de referência.
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("####  Containers / embarques previstos por mês")
+
+                volume_por_mes_container["Mes_Label"] = volume_por_mes_container[
+                    "Mes_Entrega"
+                ].dt.strftime("%m/%Y")
+                volume_por_mes_container["Containers"] = volume_por_mes_container[
+                    "Mes_Entrega"
+                ].map(df_containers.groupby("Mes_Entrega")["Container_Ref"].nunique())
+
+                fig_container_mes = px.bar(
+                    volume_por_mes_container,
+                    x="Mes_Label",
+                    y="Quantidade_kg",
+                    text="Containers",
+                    labels={
+                        "Mes_Label": "Mês de entrega",
+                        "Quantidade_kg": "Volume previsto (kg)",
+                    },
+                    title="Volume consolidado por mês de chegada no armazém",
+                )
+                fig_container_mes.update_traces(
+                    marker_color="#4B2A85",
+                    texttemplate="%{text} embarques",
+                    textposition="outside",
+                    hovertemplate="<b>%{x}</b><br>Volume: %{y:,.2f} kg<br>Embarques: %{text}<extra></extra>",
+                )
+                fig_container_mes.update_layout(
+                    height=430,
+                    showlegend=False,
+                    margin=dict(t=60, b=40, l=40, r=40),
+                    yaxis_title="Volume (kg)",
+                    xaxis_title="Mês de entrega",
+                )
+                st.plotly_chart(fig_container_mes, use_container_width=True)
+
+                col_ct1, col_ct2 = st.columns(2)
+
+                with col_ct1:
+                    st.markdown("####  Status dos embarques")
+                    dados_status = (
+                        df_containers.groupby("Status_Entrega", as_index=False)
+                        .agg(
+                            Containers=("Container_Ref", "nunique"),
+                            Quantidade_kg=("Quantidade_kg", "sum"),
+                        )
+                        .sort_values("Containers", ascending=False)
+                    )
+                    fig_status = px.pie(
+                        dados_status,
+                        names="Status_Entrega",
+                        values="Containers",
+                        hole=0.45,
+                        color_discrete_sequence=[
+                            "#E91010",
+                            "#FFB800",
+                            "#07E249",
+                            "#00E5FF",
+                            "#4B2A85",
+                        ],
+                    )
+                    fig_status.update_traces(
+                        textinfo="percent+label",
+                        hovertemplate="<b>%{label}</b><br>Containers/embarques: %{value}<extra></extra>",
+                    )
+                    fig_status.update_layout(
+                        height=420, margin=dict(t=20, b=30, l=20, r=20)
+                    )
+                    st.plotly_chart(fig_status, use_container_width=True)
+
+                with col_ct2:
+                    st.markdown("####  Top fornecedores por volume consolidado")
+                    dados_fornecedor_container = (
+                        df_containers.groupby("Fornecedor", as_index=False)[
+                            "Quantidade_kg"
+                        ]
+                        .sum()
+                        .sort_values("Quantidade_kg", ascending=False)
+                        .head(10)
+                    )
+                    fig_fornecedor_container = px.bar(
+                        dados_fornecedor_container,
+                        x="Quantidade_kg",
+                        y="Fornecedor",
+                        orientation="h",
+                        text="Quantidade_kg",
+                        labels={
+                            "Quantidade_kg": "Volume (kg)",
+                            "Fornecedor": "Fornecedor",
+                        },
+                    )
+                    fig_fornecedor_container.update_traces(
+                        marker_color="#5A339B",
+                        texttemplate="%{text:,.0f} kg",
+                        textposition="outside",
+                        hovertemplate="<b>%{y}</b><br>Volume: %{x:,.2f} kg<extra></extra>",
+                    )
+                    fig_fornecedor_container.update_layout(
+                        height=420,
+                        yaxis={"categoryorder": "total ascending"},
+                        margin=dict(t=20, b=40, l=20, r=40),
+                    )
+                    st.plotly_chart(fig_fornecedor_container, use_container_width=True)
+
+                st.markdown("####  Próximas chegadas de containers/embarques")
+
+                proximas_chegadas = df_containers.sort_values(
+                    "Data_Entrega_Armazem"
+                ).head(12)
+
+                tabela_containers = proximas_chegadas[
+                    [
+                        "Container_Ref",
+                        "Fornecedor",
+                        "Filial",
+                        "Data_Entrega_Armazem",
+                        "Quantidade_kg",
+                        "Produtos",
+                        "Dias_Para_Entrega",
+                        "Status_Entrega",
+                    ]
+                ].copy()
+
+                tabela_containers["Data_Entrega_Armazem"] = tabela_containers[
+                    "Data_Entrega_Armazem"
+                ].dt.strftime("%d/%m/%Y")
+                tabela_containers["Quantidade_kg"] = tabela_containers[
+                    "Quantidade_kg"
+                ].map(lambda x: f"{x:,.2f} kg")
+                tabela_containers["Dias_Para_Entrega"] = tabela_containers[
+                    "Dias_Para_Entrega"
+                ].map(
+                    lambda x: (
+                        f"Atrasado há {abs(int(x))} dias" if x < 0 else f"{int(x)} dias"
+                    )
+                )
+
+                tabela_containers.columns = [
+                    "Container / Embarque",
+                    "Fornecedor",
+                    "Filial/Matriz",
+                    "Chegada no Armazém",
+                    "Volume",
+                    "Produtos",
+                    "Prazo",
+                    "Status",
+                ]
+
+                st.dataframe(
+                    tabela_containers, use_container_width=True, hide_index=True
+                )
+
+                with st.expander("Ver base completa de containers/embarques"):
+                    tabela_completa_container = df_containers.sort_values(
+                        "Data_Entrega_Armazem"
+                    ).copy()
+                    tabela_completa_container["Data_Entrega_Armazem"] = (
+                        tabela_completa_container["Data_Entrega_Armazem"].dt.strftime(
+                            "%d/%m/%Y"
+                        )
+                    )
+                    tabela_completa_container["Quantidade_kg"] = (
+                        tabela_completa_container["Quantidade_kg"].map(
+                            lambda x: f"{x:,.2f} kg"
+                        )
+                    )
+                    tabela_completa_container["Dias_Para_Entrega"] = (
+                        tabela_completa_container["Dias_Para_Entrega"].map(
+                            lambda x: (
+                                f"Atrasado há {abs(int(x))} dias"
+                                if x < 0
+                                else f"{int(x)} dias"
+                            )
+                        )
+                    )
+                    tabela_completa_container = tabela_completa_container[
+                        [
+                            "Container_Ref",
+                            "Fornecedor",
+                            "Filial",
+                            "Data_Entrega_Armazem",
+                            "Quantidade_kg",
+                            "Produtos",
+                            "Dias_Para_Entrega",
+                            "Status_Entrega",
+                        ]
+                    ]
+                    tabela_completa_container.columns = [
+                        "Container / Embarque",
+                        "Fornecedor",
+                        "Filial/Matriz",
+                        "Chegada no Armazém",
+                        "Volume",
+                        "Produtos",
+                        "Prazo",
+                        "Status",
+                    ]
+                    st.dataframe(
+                        tabela_completa_container,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
 except Exception as erro:
     st.error(f"Erro ao processar e estruturar o painel de COMEX: {erro}")
