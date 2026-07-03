@@ -757,7 +757,7 @@ try:
     # TAB 4: ESTOQUE EM TRÂNSITO
     # --------------------------------------------------
     with tab_transito:
-        st.markdown("### 🚚 Estoque em Trânsito")
+        st.markdown("###  Estoque em Trânsito")
         st.caption(
             "Visão executiva dos pedidos de compra/importação em andamento, considerando a data de entrega no armazém como disponibilidade do material."
         )
@@ -867,7 +867,7 @@ try:
                 st.markdown(
                     f"""
                     <div class="alert-box" style="border-left-color: #00E5FF !important;">
-                        <span class="alert-title" style="color: #00E5FF !important;">📢 Resumo Executivo do Trânsito</span>
+                        <span class="alert-title" style="color: #00E5FF !important;"> Resumo Executivo do Trânsito</span>
                         <span class="alert-text">
                             <strong>{formatar_kg(total_kg_transito)}</strong> de produtos estão em trânsito/importação.<br>
                             O maior volume está previsto para <strong>{maior_mes_label}</strong>, com <strong>{formatar_kg(maior_mes_kg)}</strong>.<br>
@@ -879,7 +879,7 @@ try:
                     unsafe_allow_html=True,
                 )
 
-                st.markdown("#### 📅 Entrada prevista por mês")
+                st.markdown("####  Entrada prevista por mês")
 
                 volume_mes["Mes_Label"] = volume_mes["Mes_Entrega"].dt.strftime("%m/%Y")
                 fig_mes = px.bar(
@@ -911,7 +911,7 @@ try:
                 g_for, g_filial = st.columns(2)
 
                 with g_for:
-                    st.markdown("#### 🏭 Top fornecedores por volume em trânsito")
+                    st.markdown("####  Top fornecedores por volume em trânsito")
                     dados_fornecedor = (
                         df_transito_filtrado.groupby(
                             "Fornecedor", dropna=False, as_index=False
@@ -945,7 +945,7 @@ try:
                     st.plotly_chart(fig_fornecedor, use_container_width=True)
 
                 with g_filial:
-                    st.markdown("#### 🏢 Distribuição por filial/matriz")
+                    st.markdown("####  Distribuição por filial/matriz")
                     dados_filial = (
                         df_transito_filtrado.groupby(
                             "Filial", dropna=False, as_index=False
@@ -975,7 +975,7 @@ try:
                     )
                     st.plotly_chart(fig_filial, use_container_width=True)
 
-                st.markdown("#### 📋 Detalhamento do estoque em trânsito")
+                st.markdown("####  Detalhamento do estoque em trânsito")
                 tabela_transito = df_transito_filtrado[
                     [
                         "Data_Entrega_Armazem",
