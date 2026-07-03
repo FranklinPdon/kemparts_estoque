@@ -482,7 +482,7 @@ try:
                 " TODOS OS LOTES DESTE PRODUTO",
                 " ANÁLISE GRÁFICA MACRO",
                 " ESTOQUE EM TRÂNSITO",
-                " 🚢 CONTAINERS",
+                " CONTAINERS",
             ]
         )
     )
