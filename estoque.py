@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 import io
+import hmac
 from msal import ConfidentialClientApplication
 
 # ======================================================
@@ -273,6 +274,7 @@ def preparar_dados_transito(df_ped_compra):
 SHAREPOINT_HOST = "kempartsquimica.sharepoint.com"
 SITE_PATH = "/sites/IMPORTACAO"
 FILE_PATH = "/BASE DASHBOARD/PLANEJAMENTO DE COMPRAS 30.06.2026_FRANKLIN.xlsx"
+USERS_FILE_PATH = "/BASE DASHBOARD/USUARIOS_ESTOQUEVISION.xlsx"
 
 
 # ======================================================
@@ -290,6 +292,142 @@ def get_access_token():
     if "access_token" not in result:
         raise Exception(f"Erro de autenticação: {result.get('error_description')}")
     return result["access_token"]
+
+
+# ======================================================
+# CONTROLE DE ACESSO - LOGIN E PERFIS
+# ======================================================
+def normalizar_sim_nao(valor):
+    texto = str(valor).strip().upper()
+    return texto in ["SIM", "S", "YES", "Y", "TRUE", "1"]
+
+
+def preparar_usuarios(df_usuarios):
+    """Padroniza a planilha USUARIOS_ESTOQUEVISION.xlsx."""
+    if df_usuarios is None or df_usuarios.empty:
+        return pd.DataFrame()
+
+    dfu = df_usuarios.copy()
+    dfu.columns = [str(c).strip().upper().replace(" ", "_") for c in dfu.columns]
+
+    colunas_obrigatorias = ["LOGIN", "NOME", "SENHA", "PERFIL", "ATIVO"]
+    for col in colunas_obrigatorias:
+        if col not in dfu.columns:
+            raise Exception(
+                f"Coluna obrigatória ausente na planilha de usuários: {col}"
+            )
+
+    dfu["LOGIN"] = dfu["LOGIN"].astype(str).str.strip().str.lower()
+    dfu["NOME"] = dfu["NOME"].astype(str).str.strip()
+    dfu["SENHA"] = dfu["SENHA"].astype(str)
+    dfu["PERFIL"] = dfu["PERFIL"].astype(str).str.strip().str.upper()
+    dfu["ATIVO"] = dfu["ATIVO"].apply(normalizar_sim_nao)
+
+    # Se a planilha tiver uma coluna explícita de permissão, ela prevalece.
+    # Caso contrário, o sistema libera custos para ADMIN, DIRETORIA, SUPPLY e FINANCEIRO.
+    if "PODE_VER_CUSTOS" in dfu.columns:
+        dfu["PODE_VER_CUSTOS"] = dfu["PODE_VER_CUSTOS"].apply(normalizar_sim_nao)
+    elif "PODE_VER_CUSTO" in dfu.columns:
+        dfu["PODE_VER_CUSTOS"] = dfu["PODE_VER_CUSTO"].apply(normalizar_sim_nao)
+    else:
+        perfis_autorizados = [
+            "ADMIN",
+            "ADMINISTRADOR",
+            "DIRETORIA",
+            "SUPPLY",
+            "SUPPLY CHAIN",
+            "SUPPLY CHEN",
+            "FINANCEIRO",
+        ]
+        dfu["PODE_VER_CUSTOS"] = dfu["PERFIL"].isin(perfis_autorizados)
+
+    return dfu
+
+
+@st.cache_data(ttl=3600)
+def carregar_usuarios_sharepoint():
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    site_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_HOST}:{SITE_PATH}"
+    site_resp = requests.get(site_url, headers=headers)
+    site_resp.raise_for_status()
+    site_id = site_resp.json()["id"]
+
+    file_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:{USERS_FILE_PATH}:/content"
+    file_resp = requests.get(file_url, headers=headers)
+    file_resp.raise_for_status()
+
+    df_usuarios = pd.read_excel(io.BytesIO(file_resp.content))
+    return preparar_usuarios(df_usuarios)
+
+
+def autenticar_usuario(login, senha, df_usuarios):
+    login = str(login).strip().lower()
+    senha = str(senha)
+
+    if df_usuarios is None or df_usuarios.empty:
+        return None
+
+    usuario = df_usuarios[
+        (df_usuarios["LOGIN"] == login) & (df_usuarios["ATIVO"] == True)
+    ]
+    if usuario.empty:
+        return None
+
+    registro = usuario.iloc[0]
+    senha_planilha = str(registro["SENHA"])
+
+    if not hmac.compare_digest(senha, senha_planilha):
+        return None
+
+    return {
+        "login": registro["LOGIN"],
+        "nome": registro["NOME"],
+        "perfil": registro["PERFIL"],
+        "pode_ver_custos": bool(registro["PODE_VER_CUSTOS"]),
+    }
+
+
+def tela_login():
+    """Exibe tela de login antes do painel."""
+    st.markdown("## 🔐 Acesso ao ESTOQUEVISION")
+    st.caption(
+        "Informe seu login e senha para acessar o painel conforme seu perfil de permissão."
+    )
+
+    with st.form("form_login"):
+        login = st.text_input("Login / e-mail")
+        senha = st.text_input("Senha", type="password")
+        entrar = st.form_submit_button("Entrar")
+
+    if entrar:
+        try:
+            df_usuarios = carregar_usuarios_sharepoint()
+            usuario = autenticar_usuario(login, senha, df_usuarios)
+
+            if usuario is None:
+                st.error("Login ou senha inválidos, ou usuário inativo.")
+            else:
+                st.session_state["usuario_logado"] = usuario
+                st.rerun()
+        except Exception as erro_login:
+            st.error(f"Erro ao validar acesso: {erro_login}")
+
+    st.stop()
+
+
+def barra_usuario_logado(usuario):
+    col_user, col_sair = st.columns([5, 1])
+    with col_user:
+        permissao_custos = "Sim" if usuario.get("pode_ver_custos") else "Não"
+        st.caption(
+            f"👤 Usuário: **{usuario.get('nome')}** | Perfil: **{usuario.get('perfil')}** | Pode ver custos: **{permissao_custos}**"
+        )
+    with col_sair:
+        if st.button("Sair"):
+            st.session_state.pop("usuario_logado", None)
+            st.rerun()
 
 
 @st.cache_data(ttl=3600)  # Atualiza a cada 1 hora
@@ -337,6 +475,17 @@ st.subheader("Inteligência e Gestão de Estoques de Importação")
 st.caption(
     f"Análise Estratégica Baseada em Dados Atualizados | Data de Referência: {DATA_HOJE.strftime('%d/%m/%Y')}"
 )
+st.divider()
+
+# ======================================================
+# LOGIN DO SISTEMA
+# ======================================================
+if "usuario_logado" not in st.session_state:
+    tela_login()
+
+usuario_logado = st.session_state["usuario_logado"]
+pode_ver_custos = usuario_logado.get("pode_ver_custos", False)
+barra_usuario_logado(usuario_logado)
 st.divider()
 
 # ======================================================
@@ -460,7 +609,7 @@ try:
                     <strong>Produto:</strong> {lote_mais_antigo["Descricao"]}<br>
                     <strong>Lote / Entrada:</strong> {lote_mais_antigo["Lote"]} ({lote_mais_antigo["Dt. Entrada"].strftime("%d/%m/%Y")})<br>
                     <strong>Tempo de Casa:</strong> {lote_mais_antigo["Dias_no_Estoque"]} dias retido<br>
-                    <strong>Capital Imobilizado:</strong> {custo_antigo_formatado}
+                    {f"<strong>Capital Imobilizado:</strong> {custo_antigo_formatado}" if pode_ver_custos else "<strong>Observação:</strong> Informação financeira restrita para este perfil."}
                 </span>
             </div>
             """,
@@ -491,51 +640,94 @@ try:
     # TAB 1: VISÃO GERAL E KPIs
     # --------------------------------------------------
     with tab_visao_geral:
-        vlr_total = (
-            df_filtrado["Custo total estoque"].sum() if not df_filtrado.empty else 0
-        )
-        vlr_vencido = (
-            df_filtrado[df_filtrado["Classificacao_Saude"] == "VENCIDO"][
-                "Custo total estoque"
-            ].sum()
-            if not df_filtrado.empty
-            else 0
-        )
-        vlr_risco = (
-            df_filtrado[df_filtrado["Classificacao_Saude"] == "À VENCER"][
-                "Custo total estoque"
-            ].sum()
-            if not df_filtrado.empty
-            else 0
-        )
-        vlr_baixo_giro = (
-            df_filtrado[df_filtrado["Classificacao_Giro"] == "Baixo Giro"][
-                "Custo total estoque"
-            ].sum()
-            if not df_filtrado.empty
-            else 0
-        )
+        if pode_ver_custos:
+            vlr_total = (
+                df_filtrado["Custo total estoque"].sum() if not df_filtrado.empty else 0
+            )
+            vlr_vencido = (
+                df_filtrado[df_filtrado["Classificacao_Saude"] == "VENCIDO"][
+                    "Custo total estoque"
+                ].sum()
+                if not df_filtrado.empty
+                else 0
+            )
+            vlr_risco = (
+                df_filtrado[df_filtrado["Classificacao_Saude"] == "À VENCER"][
+                    "Custo total estoque"
+                ].sum()
+                if not df_filtrado.empty
+                else 0
+            )
+            vlr_baixo_giro = (
+                df_filtrado[df_filtrado["Classificacao_Giro"] == "Baixo Giro"][
+                    "Custo total estoque"
+                ].sum()
+                if not df_filtrado.empty
+                else 0
+            )
 
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-title">Custo Total em Estoque</div><div class="metric-value">{formatar_valor_comex(vlr_total)}</div></div>',
-                unsafe_allow_html=True,
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-title">Custo Total em Estoque</div><div class="metric-value">{formatar_valor_comex(vlr_total)}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col2:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-title">Custo Total Vencido</div><div class="metric-value">{formatar_valor_comex(vlr_vencido)}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col3:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-title">Custo em Risco (À Vencer)</div><div class="metric-value">{formatar_valor_comex(vlr_risco)}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col4:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-title">Estoque de Baixo Giro</div><div class="metric-value">{formatar_valor_comex(vlr_baixo_giro)}</div></div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            total_skus = (
+                df_filtrado["Produto"].nunique() if not df_filtrado.empty else 0
             )
-        with col2:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-title">Custo Total Vencido</div><div class="metric-value">{formatar_valor_comex(vlr_vencido)}</div></div>',
-                unsafe_allow_html=True,
+            volume_total = (
+                df_filtrado["Saldo 1a.U.M."].sum() if not df_filtrado.empty else 0
             )
-        with col3:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-title">Custo em Risco (À Vencer)</div><div class="metric-value">{formatar_valor_comex(vlr_risco)}</div></div>',
-                unsafe_allow_html=True,
+            lotes_vencidos = (
+                len(df_filtrado[df_filtrado["Classificacao_Saude"] == "VENCIDO"])
+                if not df_filtrado.empty
+                else 0
             )
-        with col4:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-title">Estoque de Baixo Giro</div><div class="metric-value">{formatar_valor_comex(vlr_baixo_giro)}</div></div>',
-                unsafe_allow_html=True,
+            qtd_baixo_giro = (
+                len(df_filtrado[df_filtrado["Classificacao_Giro"] == "Baixo Giro"])
+                if not df_filtrado.empty
+                else 0
+            )
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-title">SKUs em Estoque</div><div class="metric-value">{total_skus}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col2:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-title">Volume Total</div><div class="metric-value">{formatar_valor_comex(volume_total, sufixo_moeda=False)}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col3:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-title">Lotes Vencidos</div><div class="metric-value">{lotes_vencidos}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col4:
+                st.markdown(
+                    f'<div class="metric-card"><div class="metric-title">Registros Baixo Giro</div><div class="metric-value">{qtd_baixo_giro}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            st.info(
+                "Seu perfil possui acesso operacional. Indicadores financeiros e de custos estão ocultos conforme política de acesso."
             )
 
     # --------------------------------------------------
@@ -544,35 +736,40 @@ try:
     with tab_detalhes_lote:
         st.markdown("#### Lista Completa de Lotes")
         if not df_filtrado.empty:
-            df_exibir = df_filtrado[
-                [
-                    "Filial",
-                    "Descricao",
-                    "Lote",
-                    "Lote Fornec.",
-                    "Dt. Entrada",
-                    "Data Validad",
-                    "Saldo 1a.U.M.",
-                    "C Unitario",
-                    "Custo total estoque",
-                    "Classificacao_Giro",
-                    "Classificacao_Saude",
-                ]
-            ].copy()
+            colunas_lotes = [
+                "Filial",
+                "Descricao",
+                "Lote",
+                "Lote Fornec.",
+                "Dt. Entrada",
+                "Data Validad",
+                "Saldo 1a.U.M.",
+                "Classificacao_Giro",
+                "Classificacao_Saude",
+            ]
+
+            if pode_ver_custos:
+                colunas_lotes.insert(7, "C Unitario")
+                colunas_lotes.insert(8, "Custo total estoque")
+
+            df_exibir = df_filtrado[colunas_lotes].copy()
 
             df_exibir["Dt. Entrada"] = df_exibir["Dt. Entrada"].dt.strftime("%d/%m/%Y")
             df_exibir["Data Validad"] = df_exibir["Data Validad"].dt.strftime(
                 "%d/%m/%Y"
             )
 
-            st.dataframe(
-                df_exibir.style.format(
+            formatos_lotes = {"Saldo 1a.U.M.": "{:,.2f}"}
+            if pode_ver_custos:
+                formatos_lotes.update(
                     {
-                        "Saldo 1a.U.M.": "{:,.2f}",
                         "C Unitario": "R$ {:,.2f}",
                         "Custo total estoque": "R$ {:,.2f}",
                     }
-                ),
+                )
+
+            st.dataframe(
+                df_exibir.style.format(formatos_lotes),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -583,7 +780,11 @@ try:
     # TAB 3: VISÃO MACRO GRÁFICA + INSPEÇÃO EXECUTIVA (DRILL-DOWN)
     # --------------------------------------------------
     with tab_graficos:
-        if not df_macro.empty:
+        if not pode_ver_custos:
+            st.info(
+                "A análise gráfica macro utiliza informações financeiras/custos e está disponível apenas para perfis autorizados."
+            )
+        elif not df_macro.empty:
             g1, g2 = st.columns(2)
 
             def obtener_dados_pizza(df_base, coluna_grupo):
