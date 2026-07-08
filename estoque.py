@@ -269,6 +269,451 @@ def preparar_dados_transito(df_ped_compra):
 
 
 # ======================================================
+# FUNÇÕES AUXILIARES - CUSTOS E PREVISÃO DE ESTOQUE
+# ======================================================
+def formatar_percentual(valor):
+    try:
+        return f"{float(valor):.1f}%"
+    except (TypeError, ValueError):
+        return "0,0%"
+
+
+def preparar_historico_custos(df_hist_venda):
+    """
+    Prepara a aba Hist. Venda para cálculo de custo médio por KG mês a mês.
+
+    Mapeamento solicitado:
+    - Coluna AM: custo por KG
+    - Coluna F: data de emissão da nota fiscal
+    - Coluna Q: quantidade
+    - Coluna M: descrição do produto
+    """
+    if df_hist_venda is None or df_hist_venda.empty:
+        return pd.DataFrame()
+
+    df_hist = df_hist_venda.copy().dropna(how="all")
+
+    posicoes = {
+        "Data_Emissao_NF": 5,  # Coluna F
+        "Produto": 12,  # Coluna M
+        "Quantidade_kg": 16,  # Coluna Q
+        "Custo_KG": 38,  # Coluna AM
+    }
+
+    if len(df_hist.columns) <= max(posicoes.values()):
+        return pd.DataFrame()
+
+    df_hist = df_hist.rename(
+        columns={df_hist.columns[pos]: nome for nome, pos in posicoes.items()}
+    )
+
+    df_hist = df_hist[
+        list(posicoes.values())
+        if False
+        else ["Data_Emissao_NF", "Produto", "Quantidade_kg", "Custo_KG"]
+    ].copy()
+
+    df_hist["Data_Emissao_NF"] = pd.to_datetime(
+        df_hist["Data_Emissao_NF"], errors="coerce", dayfirst=True
+    )
+    df_hist["Quantidade_kg"] = (
+        df_hist["Quantidade_kg"].apply(converter_numero).fillna(0)
+    )
+    df_hist["Custo_KG"] = df_hist["Custo_KG"].apply(converter_numero).fillna(0)
+
+    df_hist = df_hist.dropna(subset=["Data_Emissao_NF", "Produto"])
+    df_hist = df_hist[(df_hist["Quantidade_kg"] > 0) & (df_hist["Custo_KG"] > 0)]
+
+    if df_hist.empty:
+        return df_hist
+
+    df_hist["Mes"] = df_hist["Data_Emissao_NF"].dt.to_period("M").dt.to_timestamp()
+    df_hist["Custo_Total_Calculado"] = df_hist["Quantidade_kg"] * df_hist["Custo_KG"]
+
+    return df_hist
+
+
+def preparar_previsao_custos(df_previsao_custo):
+    """
+    Prepara a aba Previsão de custo para projeção de custo futuro.
+
+    Mapeamento solicitado:
+    - Coluna H: descrição do produto
+    - Coluna AO: custo por KG
+    - Coluna AP: mês esperado de entrega
+    """
+    if df_previsao_custo is None or df_previsao_custo.empty:
+        return pd.DataFrame()
+
+    df_prev = df_previsao_custo.copy().dropna(how="all")
+
+    posicoes = {
+        "Produto": 7,  # Coluna H
+        "Custo_KG_Projetado": 40,  # Coluna AO
+        "Mes_Entrega": 41,  # Coluna AP
+    }
+
+    if len(df_prev.columns) <= max(posicoes.values()):
+        return pd.DataFrame()
+
+    df_prev = df_prev.rename(
+        columns={df_prev.columns[pos]: nome for nome, pos in posicoes.items()}
+    )
+
+    df_prev = df_prev[["Produto", "Custo_KG_Projetado", "Mes_Entrega"]].copy()
+    df_prev["Mes_Entrega"] = pd.to_datetime(
+        df_prev["Mes_Entrega"], errors="coerce", dayfirst=True
+    )
+    df_prev["Custo_KG_Projetado"] = (
+        df_prev["Custo_KG_Projetado"].apply(converter_numero).fillna(0)
+    )
+
+    df_prev = df_prev.dropna(subset=["Produto", "Mes_Entrega"])
+    df_prev = df_prev[df_prev["Custo_KG_Projetado"] > 0]
+
+    if df_prev.empty:
+        return df_prev
+
+    df_prev["Mes"] = df_prev["Mes_Entrega"].dt.to_period("M").dt.to_timestamp()
+
+    return df_prev
+
+
+def consolidar_custo_medio_historico(df_hist_custos):
+    if df_hist_custos is None or df_hist_custos.empty:
+        return pd.DataFrame()
+
+    df_consolidado = df_hist_custos.groupby(["Produto", "Mes"], as_index=False).agg(
+        Quantidade_kg=("Quantidade_kg", "sum"),
+        Custo_Total_Calculado=("Custo_Total_Calculado", "sum"),
+    )
+    df_consolidado["Custo_KG"] = (
+        df_consolidado["Custo_Total_Calculado"] / df_consolidado["Quantidade_kg"]
+    )
+    df_consolidado["Tipo"] = "Histórico"
+    return df_consolidado
+
+
+def consolidar_custo_medio_projetado(df_previsao_custos):
+    if df_previsao_custos is None or df_previsao_custos.empty:
+        return pd.DataFrame()
+
+    df_proj = df_previsao_custos.groupby(["Produto", "Mes"], as_index=False).agg(
+        Custo_KG=("Custo_KG_Projetado", "mean")
+    )
+    df_proj["Tipo"] = "Projeção"
+    return df_proj
+
+
+def normalizar_produtos_visao(produtos_selecionados):
+    """
+    Padroniza a seleção da visão executiva.
+
+    Regra importante:
+    - Se apenas TODOS estiver selecionado, usa visão macro.
+    - Se TODOS + produto(s) estiverem selecionados, o sistema ignora TODOS
+      e considera somente os produtos específicos.
+    Isso evita que o botão Ver mais mostre Top 5 geral quando o usuário
+    já escolheu um produto específico.
+    """
+    if produtos_selecionados is None:
+        return ["TODOS"]
+
+    if isinstance(produtos_selecionados, str):
+        produtos = [produtos_selecionados]
+    else:
+        produtos = list(produtos_selecionados)
+
+    produtos = [str(p).strip() for p in produtos if str(p).strip() != ""]
+
+    if not produtos:
+        return ["TODOS"]
+
+    produtos_especificos = [p for p in produtos if p.upper() != "TODOS"]
+
+    if produtos_especificos:
+        return produtos_especificos
+
+    return ["TODOS"]
+
+
+def visao_todos_produtos(produtos_selecionados):
+    produtos = normalizar_produtos_visao(produtos_selecionados)
+    return len(produtos) == 0 or (
+        len(produtos) == 1 and str(produtos[0]).upper() == "TODOS"
+    )
+
+
+def montar_previsao_estoque_ate_fim_ano(
+    df_estoque_base, df_transito_base, produtos_selecionados
+):
+    """Monta a previsão mensal de estoque até dezembro, usando estoque atual + entradas em trânsito."""
+    produtos = normalizar_produtos_visao(produtos_selecionados)
+    todos_produtos = visao_todos_produtos(produtos)
+
+    estoque_base = df_estoque_base.copy()
+    transito_base = (
+        df_transito_base.copy() if df_transito_base is not None else pd.DataFrame()
+    )
+
+    if not todos_produtos:
+        estoque_base = estoque_base[
+            estoque_base["Descricao"].astype(str).isin([str(p) for p in produtos])
+        ]
+        if not transito_base.empty:
+            transito_base = transito_base[
+                transito_base["Produto"].astype(str).isin([str(p) for p in produtos])
+            ]
+
+    estoque_atual_kg = (
+        estoque_base["Saldo 1a.U.M."].sum() if not estoque_base.empty else 0
+    )
+
+    ano_ref = int(DATA_HOJE.year)
+    mes_inicial = pd.Timestamp(DATA_HOJE.year, DATA_HOJE.month, 1)
+    meses = pd.date_range(
+        start=mes_inicial, end=pd.Timestamp(ano_ref, 12, 1), freq="MS"
+    )
+    df_previsao = pd.DataFrame({"Mes": meses})
+
+    if not transito_base.empty:
+        entradas_mes = (
+            transito_base.groupby("Mes_Entrega", as_index=False)["Quantidade_kg"]
+            .sum()
+            .rename(
+                columns={"Mes_Entrega": "Mes", "Quantidade_kg": "Entrada_Prevista_kg"}
+            )
+        )
+    else:
+        entradas_mes = pd.DataFrame(columns=["Mes", "Entrada_Prevista_kg"])
+
+    df_previsao = df_previsao.merge(entradas_mes, on="Mes", how="left")
+    df_previsao["Entrada_Prevista_kg"] = df_previsao["Entrada_Prevista_kg"].fillna(0)
+    df_previsao["Estoque_Projetado_kg"] = (
+        estoque_atual_kg + df_previsao["Entrada_Prevista_kg"].cumsum()
+    )
+    df_previsao["Mes_Label"] = df_previsao["Mes"].dt.strftime("%m/%Y")
+
+    return estoque_atual_kg, df_previsao
+
+
+def filtrar_transito_por_produto(df_transito_base, produtos_selecionados):
+    """Filtra o trânsito pelos produtos selecionados na visão executiva."""
+    if df_transito_base is None or df_transito_base.empty:
+        return pd.DataFrame()
+    produtos = normalizar_produtos_visao(produtos_selecionados)
+    if visao_todos_produtos(produtos):
+        return df_transito_base.copy()
+    return df_transito_base[
+        df_transito_base["Produto"].astype(str).isin([str(p) for p in produtos])
+    ].copy()
+
+
+def tabela_estoque_atual_detalhe(df_estoque_base, produtos_selecionados):
+    """Detalhe inteligente do card Estoque Atual: macro em TODOS, detalhe quando há produto filtrado."""
+    if df_estoque_base is None or df_estoque_base.empty:
+        return pd.DataFrame(), "Sem dados para detalhar."
+
+    produtos = normalizar_produtos_visao(produtos_selecionados)
+    if visao_todos_produtos(produtos):
+        tabela = (
+            df_estoque_base.groupby("Descricao", as_index=False)["Saldo 1a.U.M."]
+            .sum()
+            .sort_values("Saldo 1a.U.M.", ascending=False)
+            .head(5)
+        )
+        tabela.columns = ["Produto", "Estoque Atual"]
+        tabela["Estoque Atual"] = tabela["Estoque Atual"].map(lambda x: formatar_kg(x))
+        return tabela, "Top 5 produtos por volume em estoque"
+
+    base = df_estoque_base[
+        df_estoque_base["Descricao"].astype(str).isin([str(p) for p in produtos])
+    ].copy()
+    if base.empty:
+        return pd.DataFrame(), "Sem dados para os produtos selecionados."
+
+    tabela = (
+        base.groupby("Descricao", as_index=False)
+        .agg(
+            Estoque_Atual=("Saldo 1a.U.M.", "sum"),
+            Lotes=("Lote", "nunique"),
+            Fornecedores=("Fornecedor", "nunique"),
+            Validade_Mais_Proxima=("Data Validad", "min"),
+        )
+        .sort_values("Estoque_Atual", ascending=False)
+    )
+    tabela["Estoque_Atual"] = tabela["Estoque_Atual"].map(lambda x: formatar_kg(x))
+    tabela["Validade_Mais_Proxima"] = pd.to_datetime(
+        tabela["Validade_Mais_Proxima"], errors="coerce"
+    ).dt.strftime("%d/%m/%Y")
+    tabela.columns = [
+        "Produto",
+        "Estoque atual",
+        "Lotes",
+        "Fornecedores",
+        "Validade mais próxima",
+    ]
+    return tabela, "Resumo dos produtos selecionados"
+
+
+def tabela_entradas_detalhe(df_transito_base, produtos_selecionados):
+    """Detalhe inteligente do card Entradas até Dezembro."""
+    if df_transito_base is None or df_transito_base.empty:
+        return pd.DataFrame(), "Sem entradas previstas até dezembro."
+
+    produtos = normalizar_produtos_visao(produtos_selecionados)
+    ano_ref = int(DATA_HOJE.year)
+    limite = pd.Timestamp(ano_ref, 12, 31)
+    base = df_transito_base[df_transito_base["Data_Entrega_Armazem"] <= limite].copy()
+
+    if not visao_todos_produtos(produtos):
+        base = base[base["Produto"].astype(str).isin([str(p) for p in produtos])]
+
+    if base.empty:
+        return (
+            pd.DataFrame(),
+            "Sem entradas previstas até dezembro para a seleção atual.",
+        )
+
+    if visao_todos_produtos(produtos):
+        tabela = (
+            base.groupby("Produto", as_index=False)["Quantidade_kg"]
+            .sum()
+            .sort_values("Quantidade_kg", ascending=False)
+            .head(5)
+        )
+        tabela.columns = ["Produto", "Entrada Prevista"]
+        tabela["Entrada Prevista"] = tabela["Entrada Prevista"].map(
+            lambda x: formatar_kg(x)
+        )
+        return tabela, "Top 5 produtos com maior entrada prevista"
+
+    tabela = (
+        base.groupby(["Produto", "Mes_Entrega"], as_index=False)["Quantidade_kg"]
+        .sum()
+        .sort_values(["Mes_Entrega", "Quantidade_kg"], ascending=[True, False])
+    )
+    tabela["Mês"] = tabela["Mes_Entrega"].dt.strftime("%m/%Y")
+    tabela["Quantidade"] = tabela["Quantidade_kg"].map(lambda x: formatar_kg(x))
+    tabela = tabela[["Mês", "Produto", "Quantidade"]]
+    return tabela, "Entradas previstas dos produtos selecionados"
+
+
+def tabela_previsao_fim_ano_detalhe(
+    df_estoque_base, df_transito_base, produtos_selecionados, df_previsao_estoque
+):
+    """Detalhe inteligente do card Previsão Fim do Ano."""
+    produtos = normalizar_produtos_visao(produtos_selecionados)
+
+    if visao_todos_produtos(produtos):
+        tabela = tabela_top_previsao_fim_ano(df_estoque_base, df_transito_base)
+        return tabela, "Top 5 produtos por estoque projetado até dezembro"
+
+    if df_previsao_estoque is None or df_previsao_estoque.empty:
+        return pd.DataFrame(), "Sem previsão para os produtos selecionados."
+
+    tabela = df_previsao_estoque[
+        ["Mes_Label", "Entrada_Prevista_kg", "Estoque_Projetado_kg"]
+    ].copy()
+    tabela["Entrada_Prevista_kg"] = tabela["Entrada_Prevista_kg"].map(
+        lambda x: formatar_kg(x)
+    )
+    tabela["Estoque_Projetado_kg"] = tabela["Estoque_Projetado_kg"].map(
+        lambda x: formatar_kg(x)
+    )
+    tabela.columns = ["Mês", "Entrada prevista", "Estoque projetado"]
+    return tabela, "Evolução mensal da seleção atual"
+
+
+def tabela_proximas_entradas_detalhe(df_transito_base, produtos_selecionados):
+    """Detalhe inteligente do card Próxima Entrada."""
+    if df_transito_base is None or df_transito_base.empty:
+        return pd.DataFrame(), "Sem próximas entradas previstas."
+
+    produtos = normalizar_produtos_visao(produtos_selecionados)
+    base = df_transito_base.copy()
+    if not visao_todos_produtos(produtos):
+        base = base[base["Produto"].astype(str).isin([str(p) for p in produtos])]
+
+    if base.empty:
+        return pd.DataFrame(), "Sem próximas entradas para a seleção atual."
+
+    base = base.sort_values("Data_Entrega_Armazem").head(5)
+    tabela = base[
+        ["Data_Entrega_Armazem", "Produto", "Fornecedor", "Quantidade_kg"]
+    ].copy()
+    tabela["Data_Entrega_Armazem"] = tabela["Data_Entrega_Armazem"].dt.strftime(
+        "%d/%m/%Y"
+    )
+    tabela["Quantidade_kg"] = tabela["Quantidade_kg"].map(lambda x: formatar_kg(x))
+    tabela.columns = ["Entrega", "Produto", "Fornecedor", "Quantidade"]
+    titulo = (
+        "Próximas 5 entradas previstas"
+        if visao_todos_produtos(produtos)
+        else "Próximas entradas da seleção atual"
+    )
+    return tabela, titulo
+
+
+def tabela_top_estoque_atual(df_estoque_base):
+    """Retorna os 5 principais produtos por volume atual em estoque."""
+    tabela, _ = tabela_estoque_atual_detalhe(df_estoque_base, ["TODOS"])
+    return tabela
+
+
+def tabela_top_entradas(df_transito_base):
+    """Retorna os 5 principais produtos por volume de entrada prevista."""
+    tabela, _ = tabela_entradas_detalhe(df_transito_base, ["TODOS"])
+    return tabela
+
+
+def tabela_top_previsao_fim_ano(df_estoque_base, df_transito_base):
+    """Retorna os 5 principais produtos por estoque projetado até dezembro."""
+    if df_estoque_base is None or df_estoque_base.empty:
+        estoque_prod = pd.DataFrame(columns=["Produto", "Estoque_Atual"])
+    else:
+        estoque_prod = (
+            df_estoque_base.groupby("Descricao", as_index=False)["Saldo 1a.U.M."]
+            .sum()
+            .rename(columns={"Descricao": "Produto", "Saldo 1a.U.M.": "Estoque_Atual"})
+        )
+
+    if df_transito_base is None or df_transito_base.empty:
+        entradas_prod = pd.DataFrame(columns=["Produto", "Entradas"])
+    else:
+        ano_ref = int(DATA_HOJE.year)
+        limite = pd.Timestamp(ano_ref, 12, 31)
+        base = df_transito_base[
+            df_transito_base["Data_Entrega_Armazem"] <= limite
+        ].copy()
+        entradas_prod = (
+            base.groupby("Produto", as_index=False)["Quantidade_kg"]
+            .sum()
+            .rename(columns={"Quantidade_kg": "Entradas"})
+            if not base.empty
+            else pd.DataFrame(columns=["Produto", "Entradas"])
+        )
+
+    tabela = estoque_prod.merge(entradas_prod, on="Produto", how="outer").fillna(0)
+    if tabela.empty:
+        return pd.DataFrame()
+    tabela["Previsao_Fim_Ano"] = tabela["Estoque_Atual"] + tabela["Entradas"]
+    tabela = tabela.sort_values("Previsao_Fim_Ano", ascending=False).head(5)
+    tabela = tabela[["Produto", "Previsao_Fim_Ano"]]
+    tabela.columns = ["Produto", "Previsão Fim do Ano"]
+    tabela["Previsão Fim do Ano"] = tabela["Previsão Fim do Ano"].map(
+        lambda x: formatar_kg(x)
+    )
+    return tabela
+
+
+def tabela_proximas_entradas(df_transito_base):
+    """Retorna as 5 próximas entradas previstas."""
+    tabela, _ = tabela_proximas_entradas_detalhe(df_transito_base, ["TODOS"])
+    return tabela
+
+
+# ======================================================
 # CONFIGURAÇÃO SHAREPOINT (EDITE AQUI SE NECESSÁRIO)
 # ======================================================
 SHAREPOINT_HOST = "kempartsquimica.sharepoint.com"
@@ -420,10 +865,7 @@ def tela_login():
 def barra_usuario_logado(usuario):
     col_user, col_sair = st.columns([5, 1])
     with col_user:
-        permissao_custos = "Sim" if usuario.get("pode_ver_custos") else "Não"
-        st.caption(
-            f"👤 Usuário: **{usuario.get('nome')}** | Perfil: **{usuario.get('perfil')}** | Pode ver custos: **{permissao_custos}**"
-        )
+        st.caption(f"👋 Bem-vindo, **{usuario.get('nome')}**")
     with col_sair:
         if st.button("Sair"):
             st.session_state.pop("usuario_logado", None)
@@ -458,7 +900,23 @@ def carregar_dados_sharepoint():
     except Exception:
         df_ped_compra = pd.DataFrame()
 
-    return df_estoque, df_ped_compra
+    # A aba Hist. Venda alimenta o custo médio histórico mês a mês.
+    try:
+        arquivo_excel.seek(0)
+        df_hist_venda = pd.read_excel(arquivo_excel, sheet_name="Hist. Venda", header=1)
+    except Exception:
+        df_hist_venda = pd.DataFrame()
+
+    # A aba Previsão de custo alimenta a projeção futura de custo por KG.
+    try:
+        arquivo_excel.seek(0)
+        df_previsao_custo = pd.read_excel(
+            arquivo_excel, sheet_name="Previsão de custo", header=1
+        )
+    except Exception:
+        df_previsao_custo = pd.DataFrame()
+
+    return df_estoque, df_ped_compra, df_hist_venda, df_previsao_custo
 
 
 # ======================================================
@@ -493,7 +951,9 @@ st.divider()
 # ======================================================
 try:
     with st.spinner("Carregando dados do SharePoint..."):
-        df, df_ped_compra = carregar_dados_sharepoint()
+        df, df_ped_compra, df_hist_venda, df_previsao_custo = (
+            carregar_dados_sharepoint()
+        )
 
     df = df.dropna(subset=["Produto", "Dt. Entrada", "Data Validad"])
     df["Dt. Entrada"] = pd.to_datetime(df["Dt. Entrada"], errors="coerce")
@@ -531,6 +991,14 @@ try:
     df_transito = preparar_dados_transito(df_ped_compra)
 
     # ======================================================
+    # TRATAMENTO DAS ABAS DE CUSTOS
+    # ======================================================
+    df_hist_custos = preparar_historico_custos(df_hist_venda)
+    df_previsao_custos = preparar_previsao_custos(df_previsao_custo)
+    df_custo_hist_mensal = consolidar_custo_medio_historico(df_hist_custos)
+    df_custo_proj_mensal = consolidar_custo_medio_projetado(df_previsao_custos)
+
+    # ======================================================
     # FILTROS EM LINHA (OTIMIZADOS COM OPÇÃO "TODOS")
     # ======================================================
     st.markdown("###  Parâmetros de Consulta")
@@ -566,6 +1034,144 @@ try:
         df_macro = df.copy()
 
     st.write("")
+
+    # ======================================================
+    # VISÃO EXECUTIVA - TOTAL DE ESTOQUE E PREVISÃO ATÉ O FIM DO ANO
+    # ======================================================
+    st.markdown("###  Visão Executiva de Estoque")
+    st.caption(
+        "Resumo solicitado pela diretoria: estoque total atual, filtro por produto e previsão mensal até o fim do ano."
+    )
+
+    opcoes_produto_visao = ["TODOS"] + lista_produtos_base
+    produto_visao = st.multiselect(
+        "Selecione um ou mais produtos para analisar o estoque total e a previsão até o fim do ano:",
+        options=opcoes_produto_visao,
+        default=["TODOS"],
+        key="produto_visao_executiva",
+    )
+
+    # Regra de leitura do detalhe:
+    # - TODOS selecionado: visão macro para diretoria.
+    # - Produtos específicos: visão focada apenas nos itens selecionados.
+    produtos_visao_normalizados = normalizar_produtos_visao(produto_visao)
+    visao_macro_todos = visao_todos_produtos(produtos_visao_normalizados)
+
+    estoque_atual_kg, df_previsao_estoque = montar_previsao_estoque_ate_fim_ano(
+        df_filtrado, df_transito, produtos_visao_normalizados
+    )
+
+    entrada_total_ate_fim_ano = df_previsao_estoque["Entrada_Prevista_kg"].sum()
+    estoque_proj_fim_ano = (
+        df_previsao_estoque["Estoque_Projetado_kg"].iloc[-1]
+        if not df_previsao_estoque.empty
+        else estoque_atual_kg
+    )
+    meses_com_entrada = df_previsao_estoque[
+        df_previsao_estoque["Entrada_Prevista_kg"] > 0
+    ]
+    prox_entrada_label = (
+        meses_com_entrada.iloc[0]["Mes_Label"]
+        if not meses_com_entrada.empty
+        else "Sem previsão"
+    )
+
+    df_transito_visao = filtrar_transito_por_produto(
+        df_transito, produtos_visao_normalizados
+    )
+
+    ve1, ve2, ve3, ve4 = st.columns(4)
+    with ve1:
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Estoque Atual</div><div class="metric-value">{formatar_kg(estoque_atual_kg)}</div></div>',
+            unsafe_allow_html=True,
+        )
+        with st.popover("Ver mais"):
+            tabela, titulo = tabela_estoque_atual_detalhe(
+                df_filtrado, produtos_visao_normalizados
+            )
+            st.markdown(f"**{titulo}**")
+            if tabela.empty:
+                st.info(titulo)
+            else:
+                st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+    with ve2:
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Entradas até Dezembro</div><div class="metric-value">{formatar_kg(entrada_total_ate_fim_ano)}</div></div>',
+            unsafe_allow_html=True,
+        )
+        with st.popover("Ver mais"):
+            tabela, titulo = tabela_entradas_detalhe(
+                df_transito, produtos_visao_normalizados
+            )
+            st.markdown(f"**{titulo}**")
+            if tabela.empty:
+                st.info(titulo)
+            else:
+                st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+    with ve3:
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Previsão Fim do Ano</div><div class="metric-value">{formatar_kg(estoque_proj_fim_ano)}</div></div>',
+            unsafe_allow_html=True,
+        )
+        with st.popover("Ver mais"):
+            tabela, titulo = tabela_previsao_fim_ano_detalhe(
+                df_filtrado,
+                df_transito,
+                produtos_visao_normalizados,
+                df_previsao_estoque,
+            )
+            st.markdown(f"**{titulo}**")
+            if tabela.empty:
+                st.info(titulo)
+            else:
+                st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+    with ve4:
+        st.markdown(
+            f'<div class="metric-card"><div class="metric-title">Próxima Entrada</div><div class="metric-value">{prox_entrada_label}</div></div>',
+            unsafe_allow_html=True,
+        )
+        with st.popover("Ver mais"):
+            tabela, titulo = tabela_proximas_entradas_detalhe(
+                df_transito, produtos_visao_normalizados
+            )
+            st.markdown(f"**{titulo}**")
+            if tabela.empty:
+                st.info(titulo)
+            else:
+                st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+    if not df_previsao_estoque.empty:
+        fig_prev_estoque = px.line(
+            df_previsao_estoque,
+            x="Mes_Label",
+            y="Estoque_Projetado_kg",
+            markers=True,
+            text="Estoque_Projetado_kg",
+            labels={
+                "Mes_Label": "Mês",
+                "Estoque_Projetado_kg": "Estoque projetado (kg)",
+            },
+            title="Previsão de estoque até o fim do ano",
+        )
+        fig_prev_estoque.update_traces(
+            line=dict(width=4),
+            texttemplate="%{text:,.0f} kg",
+            textposition="top center",
+            hovertemplate="<b>%{x}</b><br>Estoque projetado: %{y:,.2f} kg<extra></extra>",
+        )
+        fig_prev_estoque.update_layout(
+            height=380,
+            margin=dict(t=60, b=40, l=40, r=40),
+            yaxis_title="Estoque projetado (kg)",
+            xaxis_title="Mês",
+        )
+        st.plotly_chart(fig_prev_estoque, use_container_width=True)
+
+    st.divider()
 
     # ======================================================
     # REQUISITOS DA GERENTE (INSIGHTS CRÍTICOS DO PRODUTO)
@@ -609,7 +1215,7 @@ try:
                     <strong>Produto:</strong> {lote_mais_antigo["Descricao"]}<br>
                     <strong>Lote / Entrada:</strong> {lote_mais_antigo["Lote"]} ({lote_mais_antigo["Dt. Entrada"].strftime("%d/%m/%Y")})<br>
                     <strong>Tempo de Casa:</strong> {lote_mais_antigo["Dias_no_Estoque"]} dias retido<br>
-                    {f"<strong>Capital Imobilizado:</strong> {custo_antigo_formatado}" if pode_ver_custos else "<strong>Observação:</strong> Informação financeira restrita para este perfil."}
+                    {f"<strong>Capital Imobilizado:</strong> {custo_antigo_formatado}" if pode_ver_custos else ""}
                 </span>
             </div>
             """,
@@ -624,17 +1230,26 @@ try:
     # ======================================================
     # TABS DE NAVEGAÇÃO PRINCIPAL
     # ======================================================
-    tab_visao_geral, tab_detalhes_lote, tab_graficos, tab_transito, tab_containers = (
-        st.tabs(
-            [
-                " VISÃO GERAL DO PRODUTO",
-                " TODOS OS LOTES DESTE PRODUTO",
-                " ANÁLISE GRÁFICA MACRO",
-                " ESTOQUE EM TRÂNSITO",
-                " CONTAINERS",
-            ]
-        )
-    )
+    abas_principais = [
+        " VISÃO GERAL DO PRODUTO",
+        " TODOS OS LOTES DESTE PRODUTO",
+        " ANÁLISE GRÁFICA MACRO",
+        " ESTOQUE EM TRÂNSITO",
+        " CONTAINERS",
+    ]
+
+    if pode_ver_custos:
+        abas_principais.append(" CUSTOS")
+
+    abas_renderizadas = st.tabs(abas_principais)
+    tab_visao_geral = abas_renderizadas[0]
+    tab_detalhes_lote = abas_renderizadas[1]
+    tab_graficos = abas_renderizadas[2]
+    tab_transito = abas_renderizadas[3]
+    tab_containers = abas_renderizadas[4]
+
+    if pode_ver_custos:
+        tab_custos = abas_renderizadas[5]
 
     # --------------------------------------------------
     # TAB 1: VISÃO GERAL E KPIs
@@ -726,9 +1341,6 @@ try:
                     f'<div class="metric-card"><div class="metric-title">Registros Baixo Giro</div><div class="metric-value">{qtd_baixo_giro}</div></div>',
                     unsafe_allow_html=True,
                 )
-            st.info(
-                "Seu perfil possui acesso operacional. Indicadores financeiros e de custos estão ocultos conforme política de acesso."
-            )
 
     # --------------------------------------------------
     # TAB 2: DETALHES DOS LOTES DO PRODUTO
@@ -781,9 +1393,7 @@ try:
     # --------------------------------------------------
     with tab_graficos:
         if not pode_ver_custos:
-            st.info(
-                "A análise gráfica macro utiliza informações financeiras/custos e está disponível apenas para perfis autorizados."
-            )
+            st.write("")
         elif not df_macro.empty:
             g1, g2 = st.columns(2)
 
@@ -1649,6 +2259,239 @@ try:
                         use_container_width=True,
                         hide_index=True,
                     )
+
+    # --------------------------------------------------
+    # TAB 6: CUSTOS - RESTRITA A PERFIS AUTORIZADOS
+    # --------------------------------------------------
+    if pode_ver_custos:
+        with tab_custos:
+            st.markdown("###  Custos")
+            st.caption(
+                "Visão restrita de custo médio histórico por KG e projeção de custo futuro por produto."
+            )
+
+            if df_custo_hist_mensal.empty and df_custo_proj_mensal.empty:
+                st.warning(
+                    "Não foram encontrados dados válidos nas abas Hist. Venda e Previsão de custo. "
+                    "Verifique se as colunas solicitadas estão preenchidas corretamente."
+                )
+            else:
+                produtos_custos = sorted(
+                    set(
+                        df_custo_hist_mensal.get("Produto", pd.Series(dtype=str))
+                        .dropna()
+                        .astype(str)
+                        .unique()
+                    )
+                    | set(
+                        df_custo_proj_mensal.get("Produto", pd.Series(dtype=str))
+                        .dropna()
+                        .astype(str)
+                        .unique()
+                    )
+                )
+                produto_custo = st.selectbox(
+                    "Selecione o produto para análise de custo:",
+                    options=["TODOS"] + produtos_custos,
+                    index=0,
+                    key="produto_custos",
+                )
+
+                hist_custo_filtrado = df_custo_hist_mensal.copy()
+                proj_custo_filtrado = df_custo_proj_mensal.copy()
+
+                if produto_custo != "TODOS":
+                    hist_custo_filtrado = hist_custo_filtrado[
+                        hist_custo_filtrado["Produto"].astype(str) == str(produto_custo)
+                    ]
+                    proj_custo_filtrado = proj_custo_filtrado[
+                        proj_custo_filtrado["Produto"].astype(str) == str(produto_custo)
+                    ]
+
+                # Quando seleciona TODOS, consolida por mês com média ponderada no histórico e média simples na projeção.
+                if produto_custo == "TODOS":
+                    if not df_hist_custos.empty:
+                        hist_plot = df_hist_custos.groupby("Mes", as_index=False).agg(
+                            Quantidade_kg=("Quantidade_kg", "sum"),
+                            Custo_Total_Calculado=("Custo_Total_Calculado", "sum"),
+                        )
+                        hist_plot["Custo_KG"] = (
+                            hist_plot["Custo_Total_Calculado"]
+                            / hist_plot["Quantidade_kg"]
+                        )
+                        hist_plot["Tipo"] = "Histórico"
+                    else:
+                        hist_plot = pd.DataFrame()
+
+                    if not df_previsao_custos.empty:
+                        proj_plot = df_previsao_custos.groupby(
+                            "Mes", as_index=False
+                        ).agg(Custo_KG=("Custo_KG_Projetado", "mean"))
+                        proj_plot["Tipo"] = "Projeção"
+                    else:
+                        proj_plot = pd.DataFrame()
+                else:
+                    hist_plot = hist_custo_filtrado.copy()
+                    proj_plot = proj_custo_filtrado.copy()
+
+                ultimo_custo_hist = (
+                    hist_plot.sort_values("Mes")["Custo_KG"].iloc[-1]
+                    if not hist_plot.empty
+                    else 0
+                )
+                proximo_custo_proj = (
+                    proj_plot.sort_values("Mes")["Custo_KG"].iloc[0]
+                    if not proj_plot.empty
+                    else 0
+                )
+                variacao_proj = (
+                    ((proximo_custo_proj - ultimo_custo_hist) / ultimo_custo_hist) * 100
+                    if ultimo_custo_hist > 0 and proximo_custo_proj > 0
+                    else 0
+                )
+                qtd_hist_total = (
+                    hist_plot["Quantidade_kg"].sum()
+                    if "Quantidade_kg" in hist_plot.columns and not hist_plot.empty
+                    else 0
+                )
+
+                cst1, cst2, cst3, cst4 = st.columns(4)
+                with cst1:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-title">Último Custo Médio</div><div class="metric-value">R$ {ultimo_custo_hist:,.2f}/kg</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cst2:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-title">Próximo Custo Projetado</div><div class="metric-value">R$ {proximo_custo_proj:,.2f}/kg</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cst3:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-title">Variação Projetada</div><div class="metric-value">{variacao_proj:.1f}%</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cst4:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-title">Volume Histórico</div><div class="metric-value">{formatar_kg(qtd_hist_total)}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown(
+                    f"""
+                    <div class="alert-box" style="border-left-color: #00E5FF !important;">
+                        <span class="alert-title" style="color: #00E5FF !important;"> Resumo Executivo de Custos</span>
+                        <span class="alert-text">
+                            O último custo médio histórico apurado é de <strong>R$ {ultimo_custo_hist:,.2f}/kg</strong>.<br>
+                            A próxima projeção de custo é de <strong>R$ {proximo_custo_proj:,.2f}/kg</strong>.<br>
+                            A variação projetada em relação ao último histórico é de <strong>{variacao_proj:.1f}%</strong>.<br>
+                            Esta aba é restrita a perfis autorizados e não aparece para usuários sem permissão de custos.
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                dados_grafico_custos = []
+                if not hist_plot.empty:
+                    temp_hist = hist_plot[["Mes", "Custo_KG", "Tipo"]].copy()
+                    dados_grafico_custos.append(temp_hist)
+                if not proj_plot.empty:
+                    temp_proj = proj_plot[["Mes", "Custo_KG", "Tipo"]].copy()
+                    dados_grafico_custos.append(temp_proj)
+
+                if dados_grafico_custos:
+                    df_grafico_custos = pd.concat(
+                        dados_grafico_custos, ignore_index=True
+                    )
+                    df_grafico_custos = df_grafico_custos.sort_values("Mes")
+                    df_grafico_custos["Mes_Label"] = df_grafico_custos[
+                        "Mes"
+                    ].dt.strftime("%m/%Y")
+
+                    st.markdown("####  Custo médio por KG mês a mês")
+                    fig_custos = px.line(
+                        df_grafico_custos,
+                        x="Mes_Label",
+                        y="Custo_KG",
+                        color="Tipo",
+                        markers=True,
+                        text="Custo_KG",
+                        labels={
+                            "Mes_Label": "Mês",
+                            "Custo_KG": "Custo por KG",
+                            "Tipo": "Origem",
+                        },
+                        title="Histórico e projeção de custo por KG",
+                    )
+                    fig_custos.update_traces(
+                        line=dict(width=4),
+                        texttemplate="R$ %{text:,.2f}",
+                        textposition="top center",
+                        hovertemplate="<b>%{x}</b><br>Custo: R$ %{y:,.2f}/kg<extra></extra>",
+                    )
+                    fig_custos.update_layout(
+                        height=430,
+                        margin=dict(t=60, b=40, l=40, r=40),
+                        yaxis_title="Custo por KG",
+                        xaxis_title="Mês",
+                    )
+                    st.plotly_chart(fig_custos, use_container_width=True)
+
+                col_hist, col_proj = st.columns(2)
+                with col_hist:
+                    st.markdown("####  Histórico por produto")
+                    if hist_custo_filtrado.empty:
+                        st.info("Sem histórico de custo para o filtro selecionado.")
+                    else:
+                        tabela_hist = hist_custo_filtrado.sort_values(
+                            "Mes", ascending=False
+                        ).copy()
+                        tabela_hist["Mes"] = tabela_hist["Mes"].dt.strftime("%m/%Y")
+                        tabela_hist["Custo_KG"] = tabela_hist["Custo_KG"].map(
+                            lambda x: f"R$ {x:,.2f}/kg"
+                        )
+                        if "Quantidade_kg" in tabela_hist.columns:
+                            tabela_hist["Quantidade_kg"] = tabela_hist[
+                                "Quantidade_kg"
+                            ].map(lambda x: f"{x:,.2f} kg")
+                        colunas_hist = [
+                            c
+                            for c in ["Produto", "Mes", "Quantidade_kg", "Custo_KG"]
+                            if c in tabela_hist.columns
+                        ]
+                        tabela_hist = tabela_hist[colunas_hist].head(30)
+                        tabela_hist.columns = [
+                            "Produto",
+                            "Mês",
+                            "Quantidade",
+                            "Custo médio",
+                        ][: len(tabela_hist.columns)]
+                        st.dataframe(
+                            tabela_hist, use_container_width=True, hide_index=True
+                        )
+
+                with col_proj:
+                    st.markdown("####  Projeção futura")
+                    if proj_custo_filtrado.empty:
+                        st.info("Sem projeção de custo para o filtro selecionado.")
+                    else:
+                        tabela_proj = proj_custo_filtrado.sort_values("Mes").copy()
+                        tabela_proj["Mes"] = tabela_proj["Mes"].dt.strftime("%m/%Y")
+                        tabela_proj["Custo_KG"] = tabela_proj["Custo_KG"].map(
+                            lambda x: f"R$ {x:,.2f}/kg"
+                        )
+                        tabela_proj = tabela_proj[["Produto", "Mes", "Custo_KG"]].head(
+                            30
+                        )
+                        tabela_proj.columns = [
+                            "Produto",
+                            "Mês previsto",
+                            "Custo projetado",
+                        ]
+                        st.dataframe(
+                            tabela_proj, use_container_width=True, hide_index=True
+                        )
 
 except Exception as erro:
     st.error(f"Erro ao processar e estruturar o painel de COMEX: {erro}")
