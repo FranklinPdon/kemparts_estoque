@@ -2,6 +2,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.io as pio
 import requests
 import io
 import hmac
@@ -86,34 +87,63 @@ st.markdown(
 
 
 # ======================================================
+# FORMATAÇÃO NUMÉRICA NO PADRÃO BRASILEIRO
+# ======================================================
+def formatar_numero_br(valor, casas=2):
+    """Formata números com ponto para milhar e vírgula para decimal."""
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        numero = 0.0
+
+    texto = f"{numero:,.{casas}f}"
+    return texto.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def formatar_moeda_br(valor, casas=2):
+    return f"R$ {formatar_numero_br(valor, casas)}"
+
+
+# Configura todos os gráficos Plotly para decimal com vírgula e milhar com ponto.
+for nome_template in ("plotly", "plotly_white", "plotly_dark"):
+    if nome_template in pio.templates:
+        pio.templates[nome_template].layout.separators = ",."
+
+
+# ======================================================
 # FUNÇÃO DE FORMATAÇÃO EXECUTIVA (K / MM)
 # ======================================================
 def formatar_valor_comex(valor, sufixo_moeda=True):
     prefixo = "R$ " if sufixo_moeda else ""
+    try:
+        valor = float(valor)
+    except (TypeError, ValueError):
+        valor = 0.0
+
     if abs(valor) >= 1_000_000:
-        return f"{prefixo}{valor / 1_000_000:.2f} MM"
+        return f"{prefixo}{formatar_numero_br(valor / 1_000_000, 2)} MM"
     elif abs(valor) >= 1_000:
-        return f"{prefixo}{valor / 1_000:.2f} K"
+        return f"{prefixo}{formatar_numero_br(valor / 1_000, 2)} K"
     else:
-        return f"{prefixo}{valor:.2f}"
+        return f"{prefixo}{formatar_numero_br(valor, 2)}"
 
 
 # ======================================================
 # FUNÇÕES AUXILIARES - ESTOQUE EM TRÂNSITO
 # ======================================================
 def formatar_kg(valor):
-    """Formata peso em kg/toneladas para leitura executiva."""
+    """Formata peso em kg/toneladas no padrão brasileiro."""
     try:
         valor = float(valor)
     except (TypeError, ValueError):
-        valor = 0
+        valor = 0.0
 
     if abs(valor) >= 1_000_000:
-        return f"{valor / 1_000_000:.2f} mil t"
+        return f"{formatar_numero_br(valor / 1_000_000, 2)} mil t"
     elif abs(valor) >= 1_000:
-        return f"{valor / 1_000:.2f} t"
+        return f"{formatar_numero_br(valor / 1_000, 2)} t"
     else:
-        return f"{valor:.0f} kg"
+        return f"{formatar_numero_br(valor, 0)} kg"
 
 
 def converter_numero(valor):
@@ -273,20 +303,20 @@ def preparar_dados_transito(df_ped_compra):
 # ======================================================
 def formatar_percentual(valor):
     try:
-        return f"{float(valor):.1f}%"
+        return f"{formatar_numero_br(valor, 1)}%"
     except (TypeError, ValueError):
         return "0,0%"
 
 
 def preparar_historico_custos(df_hist_venda):
     """
-    Prepara a aba Hist. Venda para cálculo de custo médio por KG mês a mês.
+    Prepara a aba HIST. VENDA para cálculo de custo médio por KG mês a mês.
 
-    Mapeamento solicitado:
-    - Coluna AM: custo por KG
+    Mapeamento validado na base:
     - Coluna F: data de emissão da nota fiscal
-    - Coluna Q: quantidade
     - Coluna M: descrição do produto
+    - Coluna Q: quantidade
+    - Coluna AM: custo por KG / custo unitário
     """
     if df_hist_venda is None or df_hist_venda.empty:
         return pd.DataFrame()
@@ -308,9 +338,7 @@ def preparar_historico_custos(df_hist_venda):
     )
 
     df_hist = df_hist[
-        list(posicoes.values())
-        if False
-        else ["Data_Emissao_NF", "Produto", "Quantidade_kg", "Custo_KG"]
+        ["Data_Emissao_NF", "Produto", "Quantidade_kg", "Custo_KG"]
     ].copy()
 
     df_hist["Data_Emissao_NF"] = pd.to_datetime(
@@ -328,6 +356,8 @@ def preparar_historico_custos(df_hist_venda):
         return df_hist
 
     df_hist["Mes"] = df_hist["Data_Emissao_NF"].dt.to_period("M").dt.to_timestamp()
+
+    # Para o consolidado mensal, o correto é ponderar o custo por KG pelo volume.
     df_hist["Custo_Total_Calculado"] = df_hist["Quantidade_kg"] * df_hist["Custo_KG"]
 
     return df_hist
@@ -465,8 +495,12 @@ def montar_previsao_estoque_ate_fim_ano(
                 transito_base["Produto"].astype(str).isin([str(p) for p in produtos])
             ]
 
+    # A previsão utiliza exclusivamente volume físico em KG.
+    # Não utiliza custo unitário nem valor financeiro.
     estoque_atual_kg = (
-        estoque_base["Saldo 1a.U.M."].sum() if not estoque_base.empty else 0
+        estoque_base["Saldo 1a.U.M."].apply(converter_numero).fillna(0).sum()
+        if not estoque_base.empty
+        else 0
     )
 
     ano_ref = int(DATA_HOJE.year)
@@ -872,6 +906,22 @@ def barra_usuario_logado(usuario):
             st.rerun()
 
 
+def ler_aba_excel_case_insensitive(arquivo_excel, nome_aba, header=0):
+    """
+    Lê uma aba do Excel ignorando diferença de maiúsculas/minúsculas no nome da aba.
+    Isso evita erro quando a aba está como HIST. VENDA ou PREVISÃO DE CUSTO no arquivo.
+    """
+    arquivo_excel.seek(0)
+    xls = pd.ExcelFile(arquivo_excel)
+    mapa_abas = {str(aba).strip().upper(): aba for aba in xls.sheet_names}
+    chave = str(nome_aba).strip().upper()
+
+    if chave not in mapa_abas:
+        return pd.DataFrame()
+
+    return pd.read_excel(xls, sheet_name=mapa_abas[chave], header=header)
+
+
 @st.cache_data(ttl=3600)  # Atualiza a cada 1 hora
 def carregar_dados_sharepoint():
     token = get_access_token()
@@ -890,31 +940,25 @@ def carregar_dados_sharepoint():
 
     # Ler com pandas direto da memória
     arquivo_excel = io.BytesIO(file_resp.content)
-    df_estoque = pd.read_excel(arquivo_excel, sheet_name="ESTOQUE", header=1)
 
-    # A aba PED. COMPRA alimenta o módulo de Estoque em Trânsito.
-    # Caso a aba não exista ou esteja com problema, o painel de estoque atual continua funcionando.
-    try:
-        arquivo_excel.seek(0)
-        df_ped_compra = pd.read_excel(arquivo_excel, sheet_name="PED. COMPRA", header=1)
-    except Exception:
-        df_ped_compra = pd.DataFrame()
+    # Aba ESTOQUE: cabeçalho está na linha 2 do Excel, por isso header=1.
+    df_estoque = ler_aba_excel_case_insensitive(arquivo_excel, "ESTOQUE", header=1)
 
-    # A aba Hist. Venda alimenta o custo médio histórico mês a mês.
-    try:
-        arquivo_excel.seek(0)
-        df_hist_venda = pd.read_excel(arquivo_excel, sheet_name="Hist. Venda", header=1)
-    except Exception:
-        df_hist_venda = pd.DataFrame()
+    # Aba PED. COMPRA: cabeçalho está na linha 1 do Excel, por isso header=0.
+    # Correção importante: antes estava header=1 e a primeira linha de pedido era perdida.
+    df_ped_compra = ler_aba_excel_case_insensitive(
+        arquivo_excel, "PED. COMPRA", header=0
+    )
 
-    # A aba Previsão de custo alimenta a projeção futura de custo por KG.
-    try:
-        arquivo_excel.seek(0)
-        df_previsao_custo = pd.read_excel(
-            arquivo_excel, sheet_name="Previsão de custo", header=1
-        )
-    except Exception:
-        df_previsao_custo = pd.DataFrame()
+    # Aba HIST. VENDA: cabeçalho está na linha 1 do Excel.
+    df_hist_venda = ler_aba_excel_case_insensitive(
+        arquivo_excel, "HIST. VENDA", header=0
+    )
+
+    # Aba PREVISÃO DE CUSTO: cabeçalho está na linha 1 do Excel.
+    df_previsao_custo = ler_aba_excel_case_insensitive(
+        arquivo_excel, "PREVISÃO DE CUSTO", header=0
+    )
 
     return df_estoque, df_ped_compra, df_hist_venda, df_previsao_custo
 
@@ -1164,6 +1208,7 @@ try:
             hovertemplate="<b>%{x}</b><br>Estoque projetado: %{y:,.2f} kg<extra></extra>",
         )
         fig_prev_estoque.update_layout(
+            separators=",.",
             height=380,
             margin=dict(t=60, b=40, l=40, r=40),
             yaxis_title="Estoque projetado (kg)",
@@ -1176,18 +1221,30 @@ try:
     # ======================================================
     # REQUISITOS DA GERENTE (INSIGHTS CRÍTICOS DO PRODUTO)
     # ======================================================
-    if not df_filtrado.empty:
-        st.markdown("###  Raio-X Operacional dos Itens Selecionados")
+    st.markdown("###  Raio-X Operacional dos Itens Selecionados")
 
-        lote_prox_vencido = df_filtrado.sort_values(by="Data Validad").iloc[0]
-        lote_mais_antigo = df_filtrado.sort_values(by="Dt. Entrada").iloc[0]
+    produto_raio_x = st.selectbox(
+        "Selecione o produto para consultar o Raio-X Operacional:",
+        options=["TODOS"] + lista_produtos_base,
+        index=0,
+        key="produto_raio_x",
+    )
+
+    if produto_raio_x == "TODOS":
+        df_raio_x = df_filtrado.copy()
+    else:
+        df_raio_x = df_filtrado[
+            df_filtrado["Descricao"].astype(str) == str(produto_raio_x)
+        ].copy()
+
+    if not df_raio_x.empty:
+        lote_prox_vencido = df_raio_x.sort_values(by="Data Validad").iloc[0]
+        lote_mais_antigo = df_raio_x.sort_values(by="Dt. Entrada").iloc[0]
 
         c_ins1, c_ins2 = st.columns(2)
 
         with c_ins1:
-            qtd_formatada = formatar_valor_comex(
-                lote_prox_vencido["Saldo 1a.U.M."], sufixo_moeda=False
-            )
+            qtd_formatada = formatar_kg(lote_prox_vencido["Saldo 1a.U.M."])
             st.markdown(
                 f"""
             <div class="alert-box">
@@ -1196,7 +1253,7 @@ try:
                     <strong>Produto:</strong> {lote_prox_vencido["Descricao"]}<br>
                     <strong>Lote / Fornecedor:</strong> {lote_prox_vencido["Lote"]} ({lote_prox_vencido["Fornecedor"]})<br>
                     <strong>Vencimento:</strong> {lote_prox_vencido["Data Validad"].strftime("%d/%m/%Y")}<br>
-                    <strong>Quantidade:</strong> {qtd_formatada} Un. | <strong>Status:</strong> {lote_prox_vencido["Classificacao_Saude"]}
+                    <strong>Quantidade:</strong> {qtd_formatada} | <strong>Status:</strong> {lote_prox_vencido["Classificacao_Saude"]}
                 </span>
             </div>
             """,
@@ -1204,9 +1261,26 @@ try:
             )
 
         with c_ins2:
-            custo_antigo_formatado = formatar_valor_comex(
-                lote_mais_antigo["Custo total estoque"]
+            # Capital imobilizado correto: quantidade do lote multiplicada pelo custo unitário.
+            capital_imobilizado = converter_numero(
+                lote_mais_antigo["Saldo 1a.U.M."]
+            ) * converter_numero(lote_mais_antigo["C Unitario"])
+            custo_antigo_formatado = formatar_valor_comex(capital_imobilizado)
+            custo_unitario_formatado = formatar_valor_comex(
+                converter_numero(lote_mais_antigo["C Unitario"])
             )
+
+            detalhe_custo_unitario = (
+                f"<br><strong>Custo unitário:</strong> {custo_unitario_formatado}"
+                if produto_raio_x != "TODOS" and pode_ver_custos
+                else ""
+            )
+            detalhe_capital = (
+                f"<strong>Capital Imobilizado:</strong> {custo_antigo_formatado}{detalhe_custo_unitario}"
+                if pode_ver_custos
+                else ""
+            )
+
             st.markdown(
                 f"""
             <div class="alert-box" style="border-left-color: #00E5FF !important;">
@@ -1215,7 +1289,7 @@ try:
                     <strong>Produto:</strong> {lote_mais_antigo["Descricao"]}<br>
                     <strong>Lote / Entrada:</strong> {lote_mais_antigo["Lote"]} ({lote_mais_antigo["Dt. Entrada"].strftime("%d/%m/%Y")})<br>
                     <strong>Tempo de Casa:</strong> {lote_mais_antigo["Dias_no_Estoque"]} dias retido<br>
-                    {f"<strong>Capital Imobilizado:</strong> {custo_antigo_formatado}" if pode_ver_custos else ""}
+                    {detalhe_capital}
                 </span>
             </div>
             """,
@@ -1223,7 +1297,7 @@ try:
             )
 
     else:
-        st.warning("Sem registros encontrados para os filtros aplicados.")
+        st.warning("Sem registros encontrados para o produto selecionado no Raio-X.")
 
     st.divider()
 
@@ -1238,18 +1312,12 @@ try:
         " CONTAINERS",
     ]
 
-    if pode_ver_custos:
-        abas_principais.append(" CUSTOS")
-
     abas_renderizadas = st.tabs(abas_principais)
     tab_visao_geral = abas_renderizadas[0]
     tab_detalhes_lote = abas_renderizadas[1]
     tab_graficos = abas_renderizadas[2]
     tab_transito = abas_renderizadas[3]
     tab_containers = abas_renderizadas[4]
-
-    if pode_ver_custos:
-        tab_custos = abas_renderizadas[5]
 
     # --------------------------------------------------
     # TAB 1: VISÃO GERAL E KPIs
@@ -1371,12 +1439,12 @@ try:
                 "%d/%m/%Y"
             )
 
-            formatos_lotes = {"Saldo 1a.U.M.": "{:,.2f}"}
+            formatos_lotes = {"Saldo 1a.U.M.": lambda x: formatar_numero_br(x, 2)}
             if pode_ver_custos:
                 formatos_lotes.update(
                     {
-                        "C Unitario": "R$ {:,.2f}",
-                        "Custo total estoque": "R$ {:,.2f}",
+                        "C Unitario": lambda x: formatar_moeda_br(x, 2),
+                        "Custo total estoque": lambda x: formatar_moeda_br(x, 2),
                     }
                 )
 
@@ -1443,7 +1511,9 @@ try:
                     hovertemplate="<b>%{label}</b><br>Valor Total: R$ %{value:,.2f}<br><b>Maior Impacto:</b> %{customdata[0]}<extra></extra>",
                 )
                 fig_giro.update_layout(
-                    showlegend=False, margin=dict(t=30, b=30, l=30, r=30)
+                    separators=",.",
+                    showlegend=False,
+                    margin=dict(t=30, b=30, l=30, r=30),
                 )
                 st.plotly_chart(fig_giro, use_container_width=True)
 
@@ -1477,7 +1547,9 @@ try:
                     hovertemplate="<b>%{label}</b><br>Valor Total: R$ %{value:,.2f}<br><b>Maior Impacto:</b> %{customdata[0]}<extra></extra>",
                 )
                 fig_saude.update_layout(
-                    showlegend=False, margin=dict(t=30, b=30, l=30, r=30)
+                    separators=",.",
+                    showlegend=False,
+                    margin=dict(t=30, b=30, l=30, r=30),
                 )
                 st.plotly_chart(fig_saude, use_container_width=True)
 
@@ -1534,7 +1606,7 @@ try:
                         lambda x: formatar_valor_comex(x)
                     )
                     df_top_giro["Volume_Total"] = df_top_giro["Volume_Total"].apply(
-                        lambda x: f"{x:,.0f} Un."
+                        lambda x: f"{formatar_numero_br(x, 0)} Un."
                     )
                     df_top_giro.columns = [
                         "Descrição do Produto",
@@ -1775,6 +1847,7 @@ try:
                     hovertemplate="<b>%{x}</b><br>Quantidade: %{y:,.2f} kg<extra></extra>",
                 )
                 fig_mes.update_layout(
+                    separators=",.",
                     height=430,
                     showlegend=False,
                     margin=dict(t=60, b=40, l=40, r=40),
@@ -1813,6 +1886,7 @@ try:
                         hovertemplate="<b>%{y}</b><br>Quantidade: %{x:,.2f} kg<extra></extra>",
                     )
                     fig_fornecedor.update_layout(
+                        separators=",.",
                         height=430,
                         yaxis={"categoryorder": "total ascending"},
                         margin=dict(t=20, b=40, l=20, r=40),
@@ -1846,7 +1920,7 @@ try:
                         hovertemplate="<b>%{label}</b><br>Quantidade: %{value:,.2f} kg<extra></extra>",
                     )
                     fig_filial.update_layout(
-                        height=430, margin=dict(t=20, b=40, l=20, r=20)
+                        separators=",.", height=430, margin=dict(t=20, b=40, l=20, r=20)
                     )
                     st.plotly_chart(fig_filial, use_container_width=True)
 
@@ -1867,7 +1941,7 @@ try:
                     "Data_Entrega_Armazem"
                 ].dt.strftime("%d/%m/%Y")
                 tabela_transito["Quantidade_kg"] = tabela_transito["Quantidade_kg"].map(
-                    lambda x: f"{x:,.2f} kg"
+                    lambda x: f"{formatar_numero_br(x, 2)} kg"
                 )
                 tabela_transito["Dias_Para_Entrega"] = tabela_transito[
                     "Dias_Para_Entrega"
@@ -2085,6 +2159,7 @@ try:
                     hovertemplate="<b>%{x}</b><br>Volume: %{y:,.2f} kg<br>Embarques: %{text}<extra></extra>",
                 )
                 fig_container_mes.update_layout(
+                    separators=",.",
                     height=430,
                     showlegend=False,
                     margin=dict(t=60, b=40, l=40, r=40),
@@ -2123,7 +2198,7 @@ try:
                         hovertemplate="<b>%{label}</b><br>Containers/embarques: %{value}<extra></extra>",
                     )
                     fig_status.update_layout(
-                        height=420, margin=dict(t=20, b=30, l=20, r=20)
+                        separators=",.", height=420, margin=dict(t=20, b=30, l=20, r=20)
                     )
                     st.plotly_chart(fig_status, use_container_width=True)
 
@@ -2155,6 +2230,7 @@ try:
                         hovertemplate="<b>%{y}</b><br>Volume: %{x:,.2f} kg<extra></extra>",
                     )
                     fig_fornecedor_container.update_layout(
+                        separators=",.",
                         height=420,
                         yaxis={"categoryorder": "total ascending"},
                         margin=dict(t=20, b=40, l=20, r=40),
@@ -2185,7 +2261,7 @@ try:
                 ].dt.strftime("%d/%m/%Y")
                 tabela_containers["Quantidade_kg"] = tabela_containers[
                     "Quantidade_kg"
-                ].map(lambda x: f"{x:,.2f} kg")
+                ].map(lambda x: f"{formatar_numero_br(x, 2)} kg")
                 tabela_containers["Dias_Para_Entrega"] = tabela_containers[
                     "Dias_Para_Entrega"
                 ].map(
@@ -2220,7 +2296,7 @@ try:
                     )
                     tabela_completa_container["Quantidade_kg"] = (
                         tabela_completa_container["Quantidade_kg"].map(
-                            lambda x: f"{x:,.2f} kg"
+                            lambda x: f"{formatar_numero_br(x, 2)} kg"
                         )
                     )
                     tabela_completa_container["Dias_Para_Entrega"] = (
@@ -2260,238 +2336,6 @@ try:
                         hide_index=True,
                     )
 
-    # --------------------------------------------------
-    # TAB 6: CUSTOS - RESTRITA A PERFIS AUTORIZADOS
-    # --------------------------------------------------
-    if pode_ver_custos:
-        with tab_custos:
-            st.markdown("###  Custos")
-            st.caption(
-                "Visão restrita de custo médio histórico por KG e projeção de custo futuro por produto."
-            )
-
-            if df_custo_hist_mensal.empty and df_custo_proj_mensal.empty:
-                st.warning(
-                    "Não foram encontrados dados válidos nas abas Hist. Venda e Previsão de custo. "
-                    "Verifique se as colunas solicitadas estão preenchidas corretamente."
-                )
-            else:
-                produtos_custos = sorted(
-                    set(
-                        df_custo_hist_mensal.get("Produto", pd.Series(dtype=str))
-                        .dropna()
-                        .astype(str)
-                        .unique()
-                    )
-                    | set(
-                        df_custo_proj_mensal.get("Produto", pd.Series(dtype=str))
-                        .dropna()
-                        .astype(str)
-                        .unique()
-                    )
-                )
-                produto_custo = st.selectbox(
-                    "Selecione o produto para análise de custo:",
-                    options=["TODOS"] + produtos_custos,
-                    index=0,
-                    key="produto_custos",
-                )
-
-                hist_custo_filtrado = df_custo_hist_mensal.copy()
-                proj_custo_filtrado = df_custo_proj_mensal.copy()
-
-                if produto_custo != "TODOS":
-                    hist_custo_filtrado = hist_custo_filtrado[
-                        hist_custo_filtrado["Produto"].astype(str) == str(produto_custo)
-                    ]
-                    proj_custo_filtrado = proj_custo_filtrado[
-                        proj_custo_filtrado["Produto"].astype(str) == str(produto_custo)
-                    ]
-
-                # Quando seleciona TODOS, consolida por mês com média ponderada no histórico e média simples na projeção.
-                if produto_custo == "TODOS":
-                    if not df_hist_custos.empty:
-                        hist_plot = df_hist_custos.groupby("Mes", as_index=False).agg(
-                            Quantidade_kg=("Quantidade_kg", "sum"),
-                            Custo_Total_Calculado=("Custo_Total_Calculado", "sum"),
-                        )
-                        hist_plot["Custo_KG"] = (
-                            hist_plot["Custo_Total_Calculado"]
-                            / hist_plot["Quantidade_kg"]
-                        )
-                        hist_plot["Tipo"] = "Histórico"
-                    else:
-                        hist_plot = pd.DataFrame()
-
-                    if not df_previsao_custos.empty:
-                        proj_plot = df_previsao_custos.groupby(
-                            "Mes", as_index=False
-                        ).agg(Custo_KG=("Custo_KG_Projetado", "mean"))
-                        proj_plot["Tipo"] = "Projeção"
-                    else:
-                        proj_plot = pd.DataFrame()
-                else:
-                    hist_plot = hist_custo_filtrado.copy()
-                    proj_plot = proj_custo_filtrado.copy()
-
-                ultimo_custo_hist = (
-                    hist_plot.sort_values("Mes")["Custo_KG"].iloc[-1]
-                    if not hist_plot.empty
-                    else 0
-                )
-                proximo_custo_proj = (
-                    proj_plot.sort_values("Mes")["Custo_KG"].iloc[0]
-                    if not proj_plot.empty
-                    else 0
-                )
-                variacao_proj = (
-                    ((proximo_custo_proj - ultimo_custo_hist) / ultimo_custo_hist) * 100
-                    if ultimo_custo_hist > 0 and proximo_custo_proj > 0
-                    else 0
-                )
-                qtd_hist_total = (
-                    hist_plot["Quantidade_kg"].sum()
-                    if "Quantidade_kg" in hist_plot.columns and not hist_plot.empty
-                    else 0
-                )
-
-                cst1, cst2, cst3, cst4 = st.columns(4)
-                with cst1:
-                    st.markdown(
-                        f'<div class="metric-card"><div class="metric-title">Último Custo Médio</div><div class="metric-value">R$ {ultimo_custo_hist:,.2f}/kg</div></div>',
-                        unsafe_allow_html=True,
-                    )
-                with cst2:
-                    st.markdown(
-                        f'<div class="metric-card"><div class="metric-title">Próximo Custo Projetado</div><div class="metric-value">R$ {proximo_custo_proj:,.2f}/kg</div></div>',
-                        unsafe_allow_html=True,
-                    )
-                with cst3:
-                    st.markdown(
-                        f'<div class="metric-card"><div class="metric-title">Variação Projetada</div><div class="metric-value">{variacao_proj:.1f}%</div></div>',
-                        unsafe_allow_html=True,
-                    )
-                with cst4:
-                    st.markdown(
-                        f'<div class="metric-card"><div class="metric-title">Volume Histórico</div><div class="metric-value">{formatar_kg(qtd_hist_total)}</div></div>',
-                        unsafe_allow_html=True,
-                    )
-
-                st.markdown(
-                    f"""
-                    <div class="alert-box" style="border-left-color: #00E5FF !important;">
-                        <span class="alert-title" style="color: #00E5FF !important;"> Resumo Executivo de Custos</span>
-                        <span class="alert-text">
-                            O último custo médio histórico apurado é de <strong>R$ {ultimo_custo_hist:,.2f}/kg</strong>.<br>
-                            A próxima projeção de custo é de <strong>R$ {proximo_custo_proj:,.2f}/kg</strong>.<br>
-                            A variação projetada em relação ao último histórico é de <strong>{variacao_proj:.1f}%</strong>.<br>
-                            Esta aba é restrita a perfis autorizados e não aparece para usuários sem permissão de custos.
-                        </span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                dados_grafico_custos = []
-                if not hist_plot.empty:
-                    temp_hist = hist_plot[["Mes", "Custo_KG", "Tipo"]].copy()
-                    dados_grafico_custos.append(temp_hist)
-                if not proj_plot.empty:
-                    temp_proj = proj_plot[["Mes", "Custo_KG", "Tipo"]].copy()
-                    dados_grafico_custos.append(temp_proj)
-
-                if dados_grafico_custos:
-                    df_grafico_custos = pd.concat(
-                        dados_grafico_custos, ignore_index=True
-                    )
-                    df_grafico_custos = df_grafico_custos.sort_values("Mes")
-                    df_grafico_custos["Mes_Label"] = df_grafico_custos[
-                        "Mes"
-                    ].dt.strftime("%m/%Y")
-
-                    st.markdown("####  Custo médio por KG mês a mês")
-                    fig_custos = px.line(
-                        df_grafico_custos,
-                        x="Mes_Label",
-                        y="Custo_KG",
-                        color="Tipo",
-                        markers=True,
-                        text="Custo_KG",
-                        labels={
-                            "Mes_Label": "Mês",
-                            "Custo_KG": "Custo por KG",
-                            "Tipo": "Origem",
-                        },
-                        title="Histórico e projeção de custo por KG",
-                    )
-                    fig_custos.update_traces(
-                        line=dict(width=4),
-                        texttemplate="R$ %{text:,.2f}",
-                        textposition="top center",
-                        hovertemplate="<b>%{x}</b><br>Custo: R$ %{y:,.2f}/kg<extra></extra>",
-                    )
-                    fig_custos.update_layout(
-                        height=430,
-                        margin=dict(t=60, b=40, l=40, r=40),
-                        yaxis_title="Custo por KG",
-                        xaxis_title="Mês",
-                    )
-                    st.plotly_chart(fig_custos, use_container_width=True)
-
-                col_hist, col_proj = st.columns(2)
-                with col_hist:
-                    st.markdown("####  Histórico por produto")
-                    if hist_custo_filtrado.empty:
-                        st.info("Sem histórico de custo para o filtro selecionado.")
-                    else:
-                        tabela_hist = hist_custo_filtrado.sort_values(
-                            "Mes", ascending=False
-                        ).copy()
-                        tabela_hist["Mes"] = tabela_hist["Mes"].dt.strftime("%m/%Y")
-                        tabela_hist["Custo_KG"] = tabela_hist["Custo_KG"].map(
-                            lambda x: f"R$ {x:,.2f}/kg"
-                        )
-                        if "Quantidade_kg" in tabela_hist.columns:
-                            tabela_hist["Quantidade_kg"] = tabela_hist[
-                                "Quantidade_kg"
-                            ].map(lambda x: f"{x:,.2f} kg")
-                        colunas_hist = [
-                            c
-                            for c in ["Produto", "Mes", "Quantidade_kg", "Custo_KG"]
-                            if c in tabela_hist.columns
-                        ]
-                        tabela_hist = tabela_hist[colunas_hist].head(30)
-                        tabela_hist.columns = [
-                            "Produto",
-                            "Mês",
-                            "Quantidade",
-                            "Custo médio",
-                        ][: len(tabela_hist.columns)]
-                        st.dataframe(
-                            tabela_hist, use_container_width=True, hide_index=True
-                        )
-
-                with col_proj:
-                    st.markdown("####  Projeção futura")
-                    if proj_custo_filtrado.empty:
-                        st.info("Sem projeção de custo para o filtro selecionado.")
-                    else:
-                        tabela_proj = proj_custo_filtrado.sort_values("Mes").copy()
-                        tabela_proj["Mes"] = tabela_proj["Mes"].dt.strftime("%m/%Y")
-                        tabela_proj["Custo_KG"] = tabela_proj["Custo_KG"].map(
-                            lambda x: f"R$ {x:,.2f}/kg"
-                        )
-                        tabela_proj = tabela_proj[["Produto", "Mes", "Custo_KG"]].head(
-                            30
-                        )
-                        tabela_proj.columns = [
-                            "Produto",
-                            "Mês previsto",
-                            "Custo projetado",
-                        ]
-                        st.dataframe(
-                            tabela_proj, use_container_width=True, hide_index=True
-                        )
 
 except Exception as erro:
     st.error(f"Erro ao processar e estruturar o painel de COMEX: {erro}")
