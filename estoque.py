@@ -669,8 +669,10 @@ def tabela_proximas_entradas_detalhe(df_transito_base, produtos_selecionados):
     if not visao_todos_produtos(produtos):
         base = base[base["Produto"].astype(str).isin([str(p) for p in produtos])]
 
+    base = filtrar_registros_futuros(base)
+
     if base.empty:
-        return pd.DataFrame(), "Sem próximas entradas para a seleção atual."
+        return pd.DataFrame(), "Sem próximas entradas futuras para a seleção atual."
 
     base = base.sort_values("Data_Entrega_Armazem").head(5)
     tabela = base[
@@ -969,6 +971,30 @@ def carregar_dados_sharepoint():
 BASE_DIR = Path(__file__).parent
 CAPA = BASE_DIR / "assets" / "comexcapa.png"
 DATA_HOJE = pd.to_datetime("2026-06-30")
+# Data real do dia para indicadores de próxima entrada/chegada.
+# Mantemos DATA_HOJE como referência histórica das análises de giro e validade.
+DATA_ATUAL = pd.Timestamp.now(tz="America/Sao_Paulo").tz_localize(None).normalize()
+
+
+def filtrar_registros_futuros(df_base, coluna_data="Data_Entrega_Armazem"):
+    """Retorna somente registros com data igual ou posterior ao dia atual."""
+    if df_base is None or df_base.empty or coluna_data not in df_base.columns:
+        return pd.DataFrame(
+            columns=df_base.columns if isinstance(df_base, pd.DataFrame) else None
+        )
+
+    base = df_base.copy()
+    base[coluna_data] = pd.to_datetime(base[coluna_data], errors="coerce")
+    return base[base[coluna_data].notna() & (base[coluna_data] >= DATA_ATUAL)].copy()
+
+
+def obter_proxima_data_futura(df_base, coluna_data="Data_Entrega_Armazem"):
+    """Obtém a primeira data futura; retorna None quando não houver previsão válida."""
+    futuros = filtrar_registros_futuros(df_base, coluna_data)
+    if futuros.empty:
+        return None
+    return futuros[coluna_data].min()
+
 
 if CAPA.exists():
     st.image(str(CAPA), use_container_width=True)
@@ -1111,17 +1137,14 @@ try:
         if not df_previsao_estoque.empty
         else estoque_atual_kg
     )
-    meses_com_entrada = df_previsao_estoque[
-        df_previsao_estoque["Entrada_Prevista_kg"] > 0
-    ]
-    prox_entrada_label = (
-        meses_com_entrada.iloc[0]["Mes_Label"]
-        if not meses_com_entrada.empty
-        else "Sem previsão"
-    )
-
     df_transito_visao = filtrar_transito_por_produto(
         df_transito, produtos_visao_normalizados
+    )
+    proxima_entrada_data = obter_proxima_data_futura(df_transito_visao)
+    prox_entrada_label = (
+        proxima_entrada_data.strftime("%d/%m/%Y")
+        if proxima_entrada_data is not None
+        else "Sem previsão"
     )
 
     ve1, ve2, ve3, ve4 = st.columns(4)
@@ -1759,8 +1782,17 @@ try:
                 total_fornecedores_transito = df_transito_filtrado[
                     "Fornecedor"
                 ].nunique()
-                proxima_entrega = df_transito_filtrado["Data_Entrega_Armazem"].min()
-                dias_proxima_entrega = int((proxima_entrega - DATA_HOJE).days)
+                proxima_entrega = obter_proxima_data_futura(df_transito_filtrado)
+                dias_proxima_entrega = (
+                    int((proxima_entrega - DATA_ATUAL).days)
+                    if proxima_entrega is not None
+                    else None
+                )
+                proxima_entrega_label = (
+                    proxima_entrega.strftime("%d/%m/%Y")
+                    if proxima_entrega is not None
+                    else "Sem previsão"
+                )
 
                 # Mês de maior volume previsto
                 volume_mes = (
@@ -1807,7 +1839,7 @@ try:
                     )
                 with k4:
                     st.markdown(
-                        f'<div class="metric-card"><div class="metric-title">Próxima Entrega</div><div class="metric-value">{proxima_entrega.strftime("%d/%m/%Y")}</div></div>',
+                        f'<div class="metric-card"><div class="metric-title">Próxima Entrega</div><div class="metric-value">{proxima_entrega_label}</div></div>',
                         unsafe_allow_html=True,
                     )
 
@@ -1819,7 +1851,7 @@ try:
                             <strong>{formatar_kg(total_kg_transito)}</strong> de produtos estão em trânsito/importação.<br>
                             O maior volume está previsto para <strong>{maior_mes_label}</strong>, com <strong>{formatar_kg(maior_mes_kg)}</strong>.<br>
                             O fornecedor <strong>{nome_top_fornecedor}</strong> concentra <strong>{perc_top_fornecedor:.1f}%</strong> do volume em trânsito.<br>
-                            A próxima entrega está prevista para <strong>{proxima_entrega.strftime("%d/%m/%Y")}</strong> ({dias_proxima_entrega} dias a partir da data de referência).
+                            {f"A próxima entrega está prevista para <strong>{proxima_entrega_label}</strong> ({dias_proxima_entrega} dias a partir de hoje)." if proxima_entrega is not None else "Não há uma próxima entrega futura informada na base."}
                         </span>
                     </div>
                     """,
@@ -1892,6 +1924,20 @@ try:
                         margin=dict(t=20, b=40, l=20, r=40),
                     )
                     st.plotly_chart(fig_fornecedor, use_container_width=True)
+                    if not dados_fornecedor.empty:
+                        fornecedor_lider = str(dados_fornecedor.iloc[0]["Fornecedor"])
+                        volume_lider = float(dados_fornecedor.iloc[0]["Quantidade_kg"])
+                        linhas_lider = int(
+                            (
+                                df_transito_filtrado["Fornecedor"].astype(str)
+                                == fornecedor_lider
+                            ).sum()
+                        )
+                        st.caption(
+                            f"Conferência do cálculo: {fornecedor_lider} = "
+                            f"{formatar_numero_br(volume_lider, 2)} kg, soma de {linhas_lider} linha(s) "
+                            "da aba PED. COMPRA após os filtros aplicados."
+                        )
 
                 with g_filial:
                     st.markdown("####  Distribuição por filial/matriz")
@@ -2069,7 +2115,12 @@ try:
                 containers_atrasados = df_containers[
                     df_containers["Dias_Para_Entrega"] < 0
                 ]["Container_Ref"].nunique()
-                proxima_chegada_container = df_containers["Data_Entrega_Armazem"].min()
+                proxima_chegada_container = obter_proxima_data_futura(df_containers)
+                proxima_chegada_container_label = (
+                    proxima_chegada_container.strftime("%d/%m/%Y")
+                    if proxima_chegada_container is not None
+                    else "Sem previsão"
+                )
 
                 cc1, cc2, cc3, cc4 = st.columns(4)
                 with cc1:
@@ -2089,7 +2140,7 @@ try:
                     )
                 with cc4:
                     st.markdown(
-                        f'<div class="metric-card"><div class="metric-title">Próxima Chegada</div><div class="metric-value">{proxima_chegada_container.strftime("%d/%m/%Y")}</div></div>',
+                        f'<div class="metric-card"><div class="metric-title">Próxima Chegada</div><div class="metric-value">{proxima_chegada_container_label}</div></div>',
                         unsafe_allow_html=True,
                     )
 
@@ -2239,9 +2290,16 @@ try:
 
                 st.markdown("####  Próximas chegadas de containers/embarques")
 
-                proximas_chegadas = df_containers.sort_values(
-                    "Data_Entrega_Armazem"
-                ).head(12)
+                proximas_chegadas = (
+                    filtrar_registros_futuros(df_containers)
+                    .sort_values("Data_Entrega_Armazem")
+                    .head(12)
+                )
+
+                if proximas_chegadas.empty:
+                    st.info(
+                        "Não há próximas chegadas futuras informadas na base para os filtros selecionados."
+                    )
 
                 tabela_containers = proximas_chegadas[
                     [
